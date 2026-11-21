@@ -1,0 +1,46 @@
+{
+  "name": "healthplex",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HEALTHPLEX — Smart University Gym Management System for GSFC University",
+  "scripts": {
+    "dev": "next dev -H 0.0.0.0 -p 3000",
+    "build": "next build",
+    "start": "next start -H 0.0.0.0 -p 3000",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "test:face": "node scripts/test-face-pipeline.mjs"
+  },
+  "dependencies": {
+    "@supabase/ssr": "0.12.7",
+    "@supabase/supabase-js": "2.114.0",
+    "@vladmandic/face-api": "1.7.15",
+    "jspdf": "4.2.1",
+    "jspdf-autotable": "5.0.9",
+    "lucide-react": "1.77.0",
+    "next": "16.4.6",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.5",
+    "@tensorflow/tfjs": "^4.22.0",
+    "@tensorflow/tfjs-backend-wasm": "^4.22.0",
+    "@tensorflow/tfjs-backend-webgl": "^4.22.0",
+    "@tensorflow/tfjs-converter": "^4.22.0",
+    "@tensorflow/tfjs-core": "^4.22.0",
+    "@tensorflow/tfjs-data": "^4.22.0",
+    "@tensorflow/tfjs-layers": "^4.22.0",
+    "@types/node": "24.9.2",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "jpeg-js": "^0.4.4",
+    "pngjs": "^7.0.0",
+    "tailwindcss": "4.3.5",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  }
+}
