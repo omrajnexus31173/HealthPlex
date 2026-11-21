@@ -1,0 +1,249 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { BarChart3, Building2, CalendarRange, Clock, Download, FileText, TrendingUp, Users } from "lucide-react";
+import { Shell } from "@/components/Shell";
+import { StaffGuard } from "@/components/StaffGuard";
+import { useAuth } from "@/components/AuthProvider";
+import { Alert, Button, Card, Chip, EmptyState, SectionTitle, Skeleton, StatCard } from "@/components/ui";
+import { AreaChart, BarsChart, Donut } from "@/components/Charts";
+import { createClient } from "@/lib/supabase/client";
+import { downloadCsv, exportAttendancePdf } from "@/lib/data";
+import { fmtDate, percent, todayInTz } from "@/lib/format";
+
+type Trend = { day: string; visits: number; unique_students: number };
+type Dept = { department: string; code: string; visits: number; unique_students: number; students: number };
+type Peak = { hour: number; visits: number };
+type Monthly = { year: number; month: number; total_visits: number; unique_students: number; avg_duration_minutes: number | null; peak_hour: number | null };
+
+const DEPT_COLORS = ["#4fe0a2", "#38bdf8", "#a78bfa", "#fbbf24", "#f472b6", "#34d399", "#fb923c", "#60a5fa"];
+
+function AnalyticsInner() {
+  const { profile } = useAuth();
+  const [days, setDays] = useState(30);
+  const [trend, setTrend] = useState<Trend[]>([]);
+  const [depts, setDepts] = useState<Dept[]>([]);
+  const [peaks, setPeaks] = useState<Peak[]>([]);
+  const [monthly, setMonthly] = useState<Monthly[]>([]);
+  const [totals, setTotals] = useState({ visits: 0, unique: 0, avgDuration: 0, students: 0, lateDays: 0 });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setError(null);
+      setLoading(true);
+      const supabase = createClient();
+      const [t, d, p, m, counts, studentCount] = await Promise.all([
+        supabase.rpc("attendance_trend", { p_days: days }),
+        supabase.rpc("department_stats", { p_days: days }),
+        supabase.rpc("peak_hours", { p_days: days }),
+        supabase.from("attendance_monthly_summary").select("year,month,total_visits,unique_students,avg_duration_minutes,peak_hour").order("year", { ascending: false }).order("month", { ascending: false }).limit(12),
+        supabase.rpc("live_feed", { p_limit: 1000 }),
+        supabase.from("students").select("id", { count: "exact", head: true }).is("deleted_at", null),
+      ]);
+      if (t.error) throw t.error;
+      const trendRows = ((t.data as Trend[]) ?? []).map((r) => ({ ...r, visits: Number(r.visits), unique_students: Number(r.unique_students) }));
+      setTrend(trendRows);
+      setDepts(((d.data as Dept[]) ?? []).map((r) => ({ ...r, visits: Number(r.visits), unique_students: Number(r.unique_students), students: Number(r.students) })));
+      setPeaks(((p.data as Peak[]) ?? []).map((r) => ({ hour: Number(r.hour), visits: Number(r.visits) })));
+      setMonthly(((m.data as Monthly[]) ?? []).map((r) => ({ ...r, total_visits: Number(r.total_visits) })));
+
+      const feed = (counts.data as { check_in_at: string; check_out_at: string | null }[]) ?? [];
+      const durations = feed.filter((f) => f.check_out_at);
+      setTotals({
+        visits: trendRows.reduce((s, r) => s + r.visits, 0),
+        unique: Math.max(0, ...trendRows.map((r) => r.unique_students)),
+        avgDuration: durations.length ? Math.round(durations.reduce((s, f) => s + (new Date(f.check_out_at!).getTime() - new Date(f.check_in_at).getTime()) / 60000, 0) / durations.length) : 0,
+        students: studentCount.count ?? 0,
+        lateDays: trendRows.filter((r) => r.visits > 0).length,
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unable to load analytics");
+    } finally {
+      setLoading(false);
+    }
+  }, [days]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const peak = useMemo(() => (peaks.length ? [...peaks].sort((a, b) => b.visits - a.visits)[0] : null), [peaks]);
+  const activeDepts = depts.filter((d) => d.visits > 0);
+
+  const exportSummary = () => {
+    downloadCsv(`healthplex-analytics-${todayInTz()}.csv`, [
+      ["HEALTHPLEX analytics summary", `last ${days} days`, `generated ${new Date().toISOString()}`],
+      [],
+      ["Date", "Visits", "Unique students"],
+      ...trend.map((t) => [t.day, t.visits, t.unique_students]),
+      [],
+      ["Department", "Code", "Visits", "Unique students", "Enrolled students"],
+      ...depts.map((d) => [d.department, d.code, d.visits, d.unique_students, d.students]),
+      [],
+      ["Hour", "Visits"],
+      ...peaks.map((p) => [`${String(p.hour).padStart(2, "0")}:00`, p.visits]),
+    ]);
+  };
+
+  const exportPdf = () =>
+    exportAttendancePdf({
+      title: `Attendance analytics — last ${days} days`,
+      subtitle: `${totals.visits} visits · ${activeDepts.length} active departments · peak hour ${peak ? `${String(peak.hour).padStart(2, "0")}:00` : "n/a"} · generated by ${profile?.full_name}`,
+      columns: ["Date", "Visits", "Unique students"],
+      rows: trend.map((t) => [fmtDate(t.day), t.visits, t.unique_students]),
+      filename: `healthplex-analytics-${days}d.pdf`,
+    });
+
+  return (
+    <Shell
+      title="Analytics & reports"
+      subtitle={`Attendance intelligence for the last ${days} days · all figures from live database queries`}
+      actions={
+        <div className="flex gap-2">
+          <Button variant="ghost" onClick={exportSummary}><Download size={14} /> CSV</Button>
+          <Button variant="ghost" onClick={() => void exportPdf()}><FileText size={14} /> PDF</Button>
+        </div>
+      }
+    >
+      {error ? <div className="mb-4"><Alert tone="danger" title="Analytics error">{error}</Alert></div> : null}
+
+      <div className="mb-4 flex flex-wrap items-center gap-1.5 rounded-xl border border-white/8 bg-navy-950/50 p-1">
+        {[7, 14, 30, 90].map((d) => (
+          <button
+            key={d}
+            onClick={() => setDays(d)}
+            className={`rounded-lg px-3 py-1.5 text-[11.5px] font-semibold transition-colors ${days === d ? "bg-mint-500/15 text-mint-300" : "text-ink-400 hover:text-white"}`}
+          >
+            Last {d} days
+          </button>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <StatCard label="Total visits" value={totals.visits} hint={`over ${days} days`} icon={<TrendingUp size={16} />} loading={loading} />
+        <StatCard label="Peak daily attendance" value={totals.unique} hint="unique students in a day" icon={<Users size={16} />} tone="mint" loading={loading} />
+        <StatCard label="Avg session" value={`${totals.avgDuration} min`} hint="completed sessions" icon={<Clock size={16} />} loading={loading} />
+        <StatCard
+          label="Participation"
+          value={`${percent(totals.unique, totals.students)}%`}
+          hint={`of ${totals.students} registered students`}
+          icon={<BarChart3 size={16} />}
+          loading={loading}
+        />
+      </div>
+
+      <div className="mt-4 grid gap-4 xl:grid-cols-[1.5fr_1fr]">
+        <Card className="p-4">
+          <SectionTitle title="Attendance trend" subtitle={`Daily visits and unique students · ${days} days`} action={<Chip tone="green">{totals.lateDays} active days</Chip>} />
+          {loading ? <Skeleton className="h-[190px]" /> : trend.every((t) => t.visits === 0) ? (
+            <EmptyState title="No visits in this period" description="Choose a wider range or record attendance at the kiosk." icon={<CalendarRange size={20} />} />
+          ) : (
+            <AreaChart
+              data={trend.map((t) => ({ label: t.day, value: t.visits }))}
+              formatX={(v) => new Date(`${v}T00:00:00+05:30`).toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}
+            />
+          )}
+        </Card>
+        <Card className="p-4">
+          <SectionTitle title="Department-wise" subtitle="Visits and participation" />
+          {loading ? <Skeleton className="h-[180px]" /> : activeDepts.length === 0 ? (
+            <EmptyState title="No department data" description="Attendance by department appears once visits are recorded." icon={<Building2 size={20} />} />
+          ) : (
+            <Donut
+              slices={activeDepts.slice(0, 6).map((d, i) => ({ label: d.code, value: d.visits, color: DEPT_COLORS[i % DEPT_COLORS.length] }))}
+              centerValue={String(activeDepts.reduce((s, d) => s + d.visits, 0))}
+              centerLabel="visits"
+            />
+          )}
+        </Card>
+      </div>
+
+      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+        <Card className="p-4">
+          <SectionTitle title="Peak gym hours" subtitle="Check-in volume by hour of day" action={peak ? <Chip tone="amber">peak {String(peak.hour).padStart(2, "0")}:00</Chip> : null} />
+          {loading ? <Skeleton className="h-[170px]" /> : peaks.length === 0 ? (
+            <EmptyState title="No hourly data" description="Peak hours are derived from real check-in timestamps." />
+          ) : (
+            <BarsChart data={peaks.map((p) => ({ label: String(p.hour).padStart(2, "0"), value: p.visits }))} />
+          )}
+        </Card>
+
+        <Card className="p-4">
+          <SectionTitle title="Department breakdown" subtitle="Ranked by visits in the selected period" />
+          {loading ? (
+            <div className="space-y-2">{Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-9" />)}</div>
+          ) : depts.length === 0 ? (
+            <EmptyState title="No departments configured" />
+          ) : (
+            <div className="max-h-[300px] space-y-2 overflow-y-auto pr-1">
+              {depts.map((d) => (
+                <div key={d.code} className="rounded-xl border border-white/5 bg-navy-950/40 px-3 py-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-[12px] text-white">{d.department}</span>
+                    <span className="shrink-0 text-[11px] font-semibold text-mint-300">{d.visits}</span>
+                  </div>
+                  <div className="mt-1 flex items-center justify-between text-[10px] text-ink-400">
+                    <span>{d.code} · {d.students} students</span>
+                    <span>{percent(d.unique_students, Math.max(d.students, 1))}% participation</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+      </div>
+
+      <Card className="mt-4 p-4">
+        <SectionTitle
+          title="Historical monthly summaries"
+          subtitle="Archived aggregates — retained after individual attendance records are purged by the 6-month policy"
+        />
+        {loading ? (
+          <Skeleton className="h-24" />
+        ) : monthly.length === 0 ? (
+          <EmptyState
+            title="No monthly summaries yet"
+            description="Summaries are generated automatically before any retention cleanup, and can also be produced by the Super Admin from Data Management."
+          />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[620px] text-left text-[12px]">
+              <thead>
+                <tr className="border-b border-white/6 text-[10px] uppercase tracking-wider text-ink-400">
+                  <th className="px-3 py-2 font-semibold">Month</th>
+                  <th className="px-3 py-2 font-semibold">Total visits</th>
+                  <th className="px-3 py-2 font-semibold">Unique students</th>
+                  <th className="px-3 py-2 font-semibold">Avg session</th>
+                  <th className="px-3 py-2 font-semibold">Peak hour</th>
+                </tr>
+              </thead>
+              <tbody>
+                {monthly.map((m) => (
+                  <tr key={`${m.year}-${m.month}`} className="border-b border-white/4 last:border-0">
+                    <td className="px-3 py-2 text-white">
+                      {new Date(m.year, m.month - 1, 1).toLocaleDateString("en-IN", { month: "long", year: "numeric" })}
+                    </td>
+                    <td className="px-3 py-2 text-ink-400">{m.total_visits}</td>
+                    <td className="px-3 py-2 text-ink-400">{m.unique_students}</td>
+                    <td className="px-3 py-2 text-ink-400">{m.avg_duration_minutes ? `${Math.round(Number(m.avg_duration_minutes))} min` : "—"}</td>
+                    <td className="px-3 py-2 text-ink-400">{m.peak_hour != null ? `${String(m.peak_hour).padStart(2, "0")}:00` : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </Shell>
+  );
+}
+
+export default function AnalyticsPage() {
+  return (
+    <StaffGuard roles={["super_admin", "gym_admin", "gym_staff"]}>
+      <AnalyticsInner />
+    </StaffGuard>
+  );
+}

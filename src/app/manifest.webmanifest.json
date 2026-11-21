@@ -1,0 +1,10 @@
+{
+  "name": "HEALTHPLEX — GSFC University Gym",
+  "short_name": "HEALTHPLEX",
+  "description": "Smart University Gym Management System",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#04091a",
+  "theme_color": "#050b1c",
+  "icons": []
+}
