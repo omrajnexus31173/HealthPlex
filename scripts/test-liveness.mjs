@@ -142,6 +142,23 @@ const nodFrames = seq(14, 210, (i) => ({ eyeOpen: 1, jitter: 1, depth: i > 6 ? 1
 const nod = scoreLiveness(nodFrames, "nod");
 check(nod.score >= 0.6, "a genuine nod (depth change) passes", `score ${nod.score.toFixed(3)}`);
 
+// ------------------------------------------------- early blink in a long challenge
+// A user who blinks in the first second of a 4.2 s challenge must still pass. An
+// evidence window shorter than the challenge duration aged that blink out and told
+// them "no blink detected" for a blink they had actually performed.
+const earlyBlink = Array.from({ length: 35 }, (_, i) =>
+  sample(i * 120, { eyeOpen: i >= 7 && i <= 9 ? 0.05 : 1, jitter: 1 }),
+);
+const early = scoreLiveness(earlyBlink, "blink");
+check(early.score >= 0.6, "a blink early in a 4.2 s challenge still passes", `score ${early.score.toFixed(3)}`);
+
+// ------------------------------------------------ noisy photograph is still a photo
+// Detector jitter of a few pixels must not be mistaken for a live face. Measuring spans
+// min->max let this reach 0.5: close to the threshold, on a static image.
+const noisyStill = Array.from({ length: 30 }, (_, i) => sample(i * 120, { eyeOpen: 1, jitter: 4 }));
+const noisyStillResult = scoreLiveness(noisyStill, "blink");
+check(noisyStillResult.score < 0.3, "a heavily noisy static photo stays far below the threshold", `score ${noisyStillResult.score.toFixed(3)}`);
+
 // ------------------------------------------------------------------ stale evidence
 // a blink from 10 s ago must not authenticate today's scan
 const stale = [

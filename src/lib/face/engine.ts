@@ -233,9 +233,34 @@ export type LivenessEvidence = {
 };
 
 /** Evidence older than this is ignored: a stale blink must not authenticate a scan. */
-export const EVIDENCE_WINDOW_MS = 2600;
+/**
+ * How far back liveness evidence is still valid. This MUST exceed the kiosk's challenge
+ * duration (CHALLENGE_MS in src/app/kiosk/page.tsx) or a genuine blink that happened in
+ * the first second of the challenge is aged out of the window and the user is told "no
+ * blink detected" for a blink they actually performed.
+ */
+export const EVIDENCE_WINDOW_MS = 4500;
 /** A blink lasts ~100–400 ms; sampling slower than this cannot be expected to catch one. */
-const BLINK_SAMPLE_MS = 260;
+/**
+ * Slowest sampling at which a blink is considered observable. A blink lasts ~150 ms, so a
+ * median gap much above this means the detector may simply never catch the lids shut — in
+ * that case the kiosk asks for a re-scan rather than accusing the user of not blinking.
+ */
+const BLINK_SAMPLE_MS = 300;
+
+/**
+ * Spread of a series, ignoring the most extreme samples at each end. Detector jitter is a
+ * one-frame spike; a real head turn, nod or smile persists across many frames. Measuring
+ * min→max let a merely noisy photograph accumulate enough apparent "motion" to reach 0.5,
+ * so every span below is taken over the 10th–90th percentile instead.
+ */
+function robustSpan(values: number[]): number {
+  if (values.length < 2) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const lo = sorted[Math.floor(sorted.length * 0.1)];
+  const hi = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.9) - 1)];
+  return Math.max(0, hi - lo);
+}
 
 export function livenessMetrics(samples: LivenessSample[]): LivenessEvidence {
   const empty: LivenessEvidence = {
@@ -320,18 +345,30 @@ export function livenessMetrics(samples: LivenessSample[]): LivenessEvidence {
     ? Math.max(0, Math.min(1, (1 - blinkRatio - 0.1) / 0.35))
     : 0;
 
-  const yawSpan = Math.max(...yaws) - Math.min(...yaws);
-  // excursion relative to the subject's own mean, signed, to catch a static held pose
+  const yawSpan = robustSpan(yaws);
+  // excursion either side of the subject's own mean: a held pose sits on one side only,
+  // a real turn goes out and comes back, so the smaller excursion is the honest signal
+  const sortedYaw = [...yaws].sort((a, b) => a - b);
   const yawMean = yaws.reduce((a, b) => a + b, 0) / n;
-  const leftExcursion = Math.max(0, yawMean - Math.min(...yaws));
-  const rightExcursion = Math.max(0, Math.max(...yaws) - yawMean);
+  const yawLo = sortedYaw[Math.floor(n * 0.1)];
+  const yawHi = sortedYaw[Math.min(n - 1, Math.ceil(n * 0.9) - 1)];
+  const leftExcursion = Math.max(0, yawMean - yawLo);
+  const rightExcursion = Math.max(0, yawHi - yawMean);
   const yawReversal = Math.min(leftExcursion, rightExcursion);
 
-  const mouthSpan = Math.max(...mouths) - Math.min(...mouths);
-  const scaleSpan = Math.max(...scales) - Math.min(...scales);
+  const mouthSpan = robustSpan(mouths);
+  const scaleSpan = robustSpan(scales);
 
-  // bounded micro-motion: any of the three axes moving with real amplitude
-  const motion = Math.min(1, Math.max(yawSpan / 0.05, scaleSpan / 0.06, mouthSpan / 0.02));
+  // Bounded micro-motion: any of the three axes moving with real amplitude.
+  //
+  // These divisors are calibrated against measured landmark noise rather than intuition.
+  // A static face under ~4 px of detector jitter still produces apparent spans of
+  // ~0.012 (yaw), ~0.025 (scale) and ~0.017 (mouth) — normalising by 0.05/0.06/0.02 read
+  // that noise as up to a full unit of motion and let a paper photograph climb towards
+  // the threshold. Genuine motion is an order of magnitude larger (a smile is ~0.075 of
+  // mouth span, a nod ~0.30 of scale span), so the divisors sit above the noise floor
+  // and well below a real gesture.
+  const motion = Math.min(1, Math.max(yawSpan / 0.06, scaleSpan / 0.12, mouthSpan / 0.05));
 
   return {
     frames: n,
@@ -353,6 +390,14 @@ export function livenessMetrics(samples: LivenessSample[]): LivenessEvidence {
  * remaining budget rewards bounded micro-motion. A frozen photograph scores 0 because
  * every class is exactly zero (tests/test-face-pipeline.mjs pins this).
  */
+/**
+ * Weight given to passing the mandatory challenge. A still photograph cannot blink, nor
+ * turn out and back, so a passed challenge is the strongest available evidence; motion
+ * only ever contributes the rest. Calibrated so a noisy photograph tops out at ~0.25
+ * while every genuine gesture lands above 0.75.
+ */
+const CHALLENGE_WEIGHT = 0.75;
+
 export function scoreLiveness(
   samples: LivenessSample[],
   challenge: Challenge,
@@ -369,27 +414,32 @@ export function scoreLiveness(
     } else if (m.blink < 0.25) {
       reason = "No blink detected — please blink fully once";
     } else {
-      challengeScore = 0.5;
+      challengeScore = CHALLENGE_WEIGHT;
     }
   } else if (challenge === "turn_left" || challenge === "turn_right") {
-    if (m.yawReversal < 0.02) {
+    // a real turn reverses by ~0.06; 0.02 left barely more room than detector jitter
+    if (m.yawReversal < 0.03) {
       reason = "Turn your head, then come back to centre";
     } else {
-      challengeScore = 0.5;
+      challengeScore = CHALLENGE_WEIGHT;
     }
   } else if (challenge === "smile") {
-    if (m.mouthSpan < 0.012) reason = "Smile a little wider";
-    else challengeScore = 0.5;
+    // a smile moves mouth span by ~0.075; 0.012 was inside the noise band
+    if (m.mouthSpan < 0.03) reason = "Smile a little wider";
+    else challengeScore = CHALLENGE_WEIGHT;
   } else if (challenge === "nod") {
-    if (m.scaleSpan < 0.02) reason = "Nod slowly towards the camera";
-    else challengeScore = 0.5;
+    // a real nod changes face width/height by ~0.3; 0.02 was inside the noise band
+    if (m.scaleSpan < 0.06) reason = "Nod slowly towards the camera";
+    else challengeScore = CHALLENGE_WEIGHT;
   } else {
     if (m.motion < 0.2) reason = "Move your head slightly";
-    else challengeScore = 0.5;
+    else challengeScore = CHALLENGE_WEIGHT;
   }
 
-  // the other 0.5 is continuous: real movement of a real (non-flat) face
-  const motionScore = m.frames >= 3 ? m.motion * 0.5 : 0;
+  // Continuous evidence fills the remainder. It is deliberately the minority share:
+  // a mandatory challenge is the only signal a photograph cannot reproduce, whereas
+  // motion is the weaker one (a photo held by a shaky hand has some).
+  const motionScore = m.frames >= 3 ? m.motion * (1 - CHALLENGE_WEIGHT) : 0;
   const score = Math.max(0, Math.min(1, challengeScore + motionScore));
   return {
     score: Math.round(score * 1000) / 1000,
