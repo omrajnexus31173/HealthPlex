@@ -1,16 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Check, Clock, Gauge, Save, ScanFace, ShieldCheck, Users } from "lucide-react";
+import { Check, Clock, Gauge, Plus, Save, ScanFace, ShieldCheck, Timer, Trash2, Users } from "lucide-react";
 import { Shell } from "@/components/Shell";
 import { StaffGuard } from "@/components/StaffGuard";
 import { useAuth } from "@/components/AuthProvider";
 import { Alert, Button, Card, Chip, SectionTitle, Skeleton } from "@/components/ui";
 import { createClient } from "@/lib/supabase/client";
-import { fmtDateTime } from "@/lib/format";
+import { fmtDate, fmtDateTime } from "@/lib/format";
 import type { GymSettings } from "@/lib/types";
 
 const DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
+
+type Holiday = { holiday_date: string; name: string };
 
 function SettingsInner() {
   const { profile, refresh } = useAuth();
@@ -19,12 +21,24 @@ function SettingsInner() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [holidays, setHolidays] = useState<Holiday[]>([]);
+  const [holidayDate, setHolidayDate] = useState("");
+  const [holidayName, setHolidayName] = useState("");
+  const [holidayBusy, setHolidayBusy] = useState(false);
+  const [minPresence, setMinPresence] = useState("30");
+  const [presenceBusy, setPresenceBusy] = useState(false);
+  const [presenceSaved, setPresenceSaved] = useState(false);
+  const isSuperAdmin = profile?.role === "super_admin";
 
   const load = useCallback(async () => {
     const supabase = createClient();
     const { data, error: err } = await supabase.from("gym_settings").select("*").eq("id", true).maybeSingle();
     if (err) setError(err.message);
-    setSettings(data as GymSettings);
+    const loaded = data as GymSettings;
+    setSettings(loaded);
+    if (loaded?.min_presence_minutes != null) setMinPresence(String(loaded.min_presence_minutes));
+    const h = await supabase.from("gym_holidays").select("holiday_date,name").order("holiday_date", { ascending: false }).limit(60);
+    setHolidays((h.data as Holiday[]) ?? []);
     setLoading(false);
   }, []);
 
@@ -66,6 +80,65 @@ function SettingsInner() {
   };
 
   const confidence = settings ? Math.round((1 - Number(settings.recognition_threshold)) * 100) : 0;
+
+  const saveMinPresence = async () => {
+    if (!isSuperAdmin) return;
+    const minutes = Number(minPresence);
+    if (!Number.isFinite(minutes) || minutes < 1 || minutes > 600) {
+      setError("Minimum presence must be between 1 and 600 minutes.");
+      return;
+    }
+    setPresenceBusy(true);
+    setError(null);
+    setPresenceSaved(false);
+    try {
+      const supabase = createClient();
+      const { error: err } = await supabase.rpc("set_min_presence_minutes", { p_minutes: minutes });
+      if (err) throw new Error(err.message);
+      setPresenceSaved(true);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not update the minimum presence threshold");
+    } finally {
+      setPresenceBusy(false);
+    }
+  };
+
+  const addHoliday = async () => {
+    if (!holidayDate || holidayName.trim().length < 2) {
+      setError("Pick a date and a holiday name (2+ characters).");
+      return;
+    }
+    setHolidayBusy(true);
+    setError(null);
+    try {
+      const supabase = createClient();
+      const { error: err } = await supabase.rpc("set_gym_holiday", { p_date: holidayDate, p_name: holidayName.trim() });
+      if (err) throw new Error(err.message);
+      setHolidayDate("");
+      setHolidayName("");
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not save the holiday");
+    } finally {
+      setHolidayBusy(false);
+    }
+  };
+
+  const removeHoliday = async (date: string) => {
+    setHolidayBusy(true);
+    setError(null);
+    try {
+      const supabase = createClient();
+      const { error: err } = await supabase.rpc("remove_gym_holiday", { p_date: date });
+      if (err) throw new Error(err.message);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not remove the holiday");
+    } finally {
+      setHolidayBusy(false);
+    }
+  };
 
   return (
     <Shell title="Gym settings" subtitle="Capacity, recognition gates and operating hours" actions={<Button onClick={() => void save()} loading={saving}><Save size={14} /> Save changes</Button>}>
@@ -159,6 +232,70 @@ function SettingsInner() {
               <span className="flex items-center gap-1"><Gauge size={11} /> Cooldown {settings.cooldown_minutes} min</span>
               <span className="flex items-center gap-1"><ScanFace size={11} /> Threshold {confidence}%</span>
               <Chip tone="green"><Check size={10} /> saved {fmtDateTime(settings.updated_at)}</Chip>
+            </div>
+            <p className="mt-2 text-[10.5px] text-ink-400">Operating days drive attendance eligibility: a day set to <b className="text-white">closed</b> is excluded from eligible operating days (and absences) until reopened.</p>
+          </Card>
+
+          <Card className="p-4 xl:col-span-2">
+            <SectionTitle title="Attendance & eligibility" subtitle="Minimum verified time for PRESENT, and official holidays excluded from the gym calendar" />
+            <div className="grid gap-4 lg:grid-cols-2">
+              <div className="rounded-xl border border-white/6 bg-navy-950/40 p-3">
+                <label className="hp-label flex items-center gap-1.5"><Timer size={11} /> Minimum verified gym time per day</label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    max={600}
+                    className="hp-input w-28"
+                    value={minPresence}
+                    onChange={(e) => setMinPresence(e.target.value)}
+                    disabled={!isSuperAdmin || presenceBusy}
+                  />
+                  <span className="text-[12px] text-ink-400">minutes (default 30)</span>
+                  {isSuperAdmin ? (
+                    <Button onClick={() => void saveMinPresence()} loading={presenceBusy} variant="ghost"><Save size={13} /> Apply</Button>
+                  ) : null}
+                </div>
+                <p className="mt-2 text-[10.5px] leading-relaxed text-ink-400">
+                  Verified entry→exit minutes are summed per day. <b className="text-white">≥ this value = present</b> (exactly at the threshold counts); below it = absent; an unresolved open visit = INCOMPLETE, never present/absent. Multiple visits combine; repeated face scans do not.
+                </p>
+                {isSuperAdmin ? (
+                  <p className="mt-1.5 text-[10px] text-ink-400/80">Super Admin only. Changing it re-classifies the current month immediately and is written to the audit log.</p>
+                ) : (
+                  <p className="mt-1.5 text-[10px] text-warn-400">Only the Super Admin can change this threshold. Current value: {settings.min_presence_minutes} min.</p>
+                )}
+                {presenceSaved ? <p className="mt-1.5 flex items-center gap-1 text-[11px] font-semibold text-mint-300"><Check size={12} /> Threshold updated and audited.</p> : null}
+              </div>
+
+              <div className="rounded-xl border border-white/6 bg-navy-950/40 p-3">
+                <label className="hp-label">Holidays & closures</label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <input type="date" className="hp-input w-36" value={holidayDate} onChange={(e) => setHolidayDate(e.target.value)} disabled={holidayBusy} />
+                  <input
+                    className="hp-input min-w-0 flex-1"
+                    placeholder="Holiday name (e.g. Diwali)"
+                    value={holidayName}
+                    onChange={(e) => setHolidayName(e.target.value)}
+                    disabled={holidayBusy}
+                  />
+                  <Button variant="ghost" onClick={() => void addHoliday()} loading={holidayBusy}><Plus size={13} /> Add</Button>
+                </div>
+                <p className="mt-2 text-[10.5px] leading-relaxed text-ink-400">Holidays are removed from eligible operating days — no student is marked absent on a holiday. Removing a holiday reinstates it (and re-marks that day where detailed records still exist).</p>
+                <ul className="mt-2 max-h-40 space-y-1.5 overflow-y-auto">
+                  {holidays.length === 0 ? (
+                    <li className="text-[11px] text-ink-400">No holidays recorded.</li>
+                  ) : (
+                    holidays.map((h) => (
+                      <li key={h.holiday_date} className="flex items-center justify-between gap-2 rounded-lg border border-white/6 bg-navy-950/60 px-2.5 py-1.5 text-[11.5px]">
+                        <span className="text-white">{fmtDate(h.holiday_date)} · <span className="text-ink-400">{h.name}</span></span>
+                        <button onClick={() => void removeHoliday(h.holiday_date)} disabled={holidayBusy} className="text-ink-400 transition-colors hover:text-[#ff8f6b]" aria-label="Remove holiday">
+                          <Trash2 size={13} />
+                        </button>
+                      </li>
+                    ))
+                  )}
+                </ul>
+              </div>
             </div>
           </Card>
         </div>

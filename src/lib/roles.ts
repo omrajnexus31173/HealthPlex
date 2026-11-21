@@ -32,6 +32,7 @@ export const NAV: NavItem[] = [
   { href: "/kiosk", label: "Attendance Kiosk", icon: "ScanFace", roles: ["super_admin", "gym_admin", "gym_staff", "trainer"], group: "Attendance" },
   { href: "/attendance", label: "Attendance Records", icon: "ClipboardList", roles: ["super_admin", "gym_admin", "gym_staff", "trainer"], group: "Attendance" },
   { href: "/attendance/analytics", label: "Analytics & Reports", icon: "BarChart3", roles: ["super_admin", "gym_admin", "gym_staff"], group: "Attendance" },
+  { href: "/attendance/reports", label: "Frequency & Reports", icon: "FileBarChart2", roles: ["super_admin", "gym_admin"], group: "Attendance" },
   { href: "/students", label: "Students", icon: "Users", roles: ["super_admin", "gym_admin"], group: "People" },
   { href: "/staff", label: "Staff & Trainers", icon: "UserCog", roles: ["super_admin", "gym_admin"], group: "People" },
   { href: "/sessions", label: "Sessions & Schedule", icon: "CalendarClock", roles: ["super_admin", "gym_admin", "gym_staff", "trainer"], group: "Gym" },
