@@ -21,15 +21,21 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ payload: data.payload, checksum: data.checksum, records: data.record_count });
   }
 
-  const [status, runs, summaries, backups, cron] = await Promise.all([
-    service.rpc("retention_status", {}),
+  const [status, runs, summaries, backups] = await Promise.all([
+    // retention_status() is SECURITY DEFINER and starts with
+    // `IF NOT is_super_admin()` — it authorises from auth.uid() in the JWT. Calling it
+    // with the service-role client therefore raised FORBIDDEN (42501) and the whole
+    // dashboard returned HTTP 500. It must be called with the caller's own session.
+    ctx.db.rpc("retention_status", {}),
     service.from("cleanup_runs").select("*").order("started_at", { ascending: false }).limit(40),
     service.from("attendance_monthly_summary").select("*").order("year", { ascending: false }).order("month", { ascending: false }).limit(24),
     service.from("cleanup_backups").select("id, created_at, cutoff_date, record_count, checksum, verified, storage_bytes").order("created_at", { ascending: false }).limit(20),
-    service.schema("cron").from("job").select("jobid, jobname, schedule, active").eq("jobname", "healthplex-monthly-attendance-retention"),
   ]);
 
   if (status.error) return jsonError(status.error.message, 500);
+  if (runs.error) return jsonError(runs.error.message, 500);
+  if (summaries.error) return jsonError(summaries.error.message, 500);
+  if (backups.error) return jsonError(backups.error.message, 500);
 
   // the RPC returns a to_jsonb() of the row even when no execution exists yet
   const statusPayload = { ...(status.data as Record<string, unknown>) };
@@ -41,8 +47,28 @@ export async function GET(request: NextRequest) {
     runs: runs.data ?? [],
     summaries: summaries.data ?? [],
     backups: backups.data ?? [],
-    cron: cron.data ?? [],
+    cron: await readRetentionCron(service),
   });
+}
+
+type CronJob = { jobid: number; jobname: string; schedule: string; active: boolean };
+
+/**
+ * The retention schedule lives in `cron.job`. PostgREST cannot expose that schema
+ * unless the API roles hold USAGE on it, and they do not, so `.schema("cron")`
+ * failed — previously with its error silently discarded, which made the dashboard
+ * look healthy while reporting nothing. Prefer the SECURITY DEFINER helper, and fall
+ * back to a bare read only if that helper is unavailable.
+ */
+async function readRetentionCron(service: ReturnType<typeof createServiceSupabase>): Promise<CronJob[]> {
+  const viaRpc = await service.rpc("retention_cron_jobs", {});
+  if (!viaRpc.error && Array.isArray(viaRpc.data)) return viaRpc.data as CronJob[];
+  const viaTable = await service
+    .schema("cron")
+    .from("job")
+    .select("jobid, jobname, schedule, active")
+    .eq("jobname", "healthplex-monthly-attendance-retention");
+  return (viaTable.data as CronJob[] | null) ?? [];
 }
 
 export async function POST(request: NextRequest) {

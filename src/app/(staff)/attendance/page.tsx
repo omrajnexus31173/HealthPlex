@@ -35,8 +35,12 @@ type Row = {
   recognition_confidence: number | null;
   correction_reason: string | null;
   marked_by: string | null;
-  profiles: { full_name: string; email: string } | null;
-  students: { enrollment_id: string; photo_path: string | null; departments: { code: string; name: string } | null } | null;
+  students: {
+    enrollment_id: string;
+    photo_path: string | null;
+    departments: { code: string; name: string } | null;
+    profiles: { full_name: string; email: string } | { full_name: string; email: string }[] | null;
+  } | null;
 };
 
 const RANGES = [
@@ -45,6 +49,21 @@ const RANGES = [
   { id: "month", label: "This month" },
   { id: "custom", label: "Custom" },
 ] as const;
+
+/**
+ * PostgREST returns an embedded to-one relationship as an object, but flattens it to
+ * an array when the FK is not statically provable as unique. Normalise once instead
+ * of guessing at each call site.
+ */
+function personOf(row: Row): { full_name: string; email: string } | null {
+  const p = row.students?.profiles;
+  if (!p) return null;
+  return Array.isArray(p) ? (p[0] ?? null) : p;
+}
+
+function nameOf(row: Row): string {
+  return personOf(row)?.full_name ?? "—";
+}
 
 function AttendanceInner() {
   const { profile } = useAuth();
@@ -85,7 +104,13 @@ function AttendanceInner() {
       const { data, error: err } = await supabase
         .from("attendance_records")
         .select(
-          "id, student_id, attendance_date, check_in_at, check_out_at, duration_minutes, entry_source, exit_source, status, recognition_confidence, correction_reason, marked_by, profiles:profiles!attendance_records_student_id_fkey(full_name,email), students:students!attendance_records_student_id_fkey(enrollment_id, photo_path, departments(code,name))",
+          // One unambiguous path to the person: attendance_records.student_id →
+          // students.id → profiles.id. The previous query also asked for
+          // profiles!attendance_records_student_id_fkey, but student_id points at
+          // students, not profiles, so PostgREST rejected the whole request with 400
+          // (PGRST200 "no relationship found"). students_id_fkey is the only link
+          // from students to profiles, so the nested embed needs no hints.
+          "id, student_id, attendance_date, check_in_at, check_out_at, duration_minutes, entry_source, exit_source, status, recognition_confidence, correction_reason, marked_by, students:students!attendance_records_student_id_fkey(enrollment_id, photo_path, departments(code,name), profiles:profiles!students_id_fkey(full_name,email))",
         )
         .gte("attendance_date", startDate)
         .lte("attendance_date", endDate)
@@ -142,7 +167,7 @@ function AttendanceInner() {
     return rows.filter((r) => {
       const matchQ =
         !q ||
-        r.profiles?.full_name.toLowerCase().includes(q) ||
+        (personOf(r)?.full_name ?? "").toLowerCase().includes(q) ||
         r.students?.enrollment_id.toLowerCase().includes(q) ||
         r.students?.departments?.code.toLowerCase().includes(q);
       const matchStatus = !statusFilter || r.status === statusFilter;
@@ -202,7 +227,7 @@ function AttendanceInner() {
       ...filtered.map((r) => [
         r.attendance_date,
         r.students?.enrollment_id,
-        r.profiles?.full_name,
+        personOf(r)?.full_name,
         r.students?.departments?.name,
         fmtDateTime(r.check_in_at),
         r.check_out_at ? fmtDateTime(r.check_out_at) : "",
@@ -223,7 +248,7 @@ function AttendanceInner() {
       rows: filtered.map((r) => [
         fmtDate(r.attendance_date),
         r.students?.enrollment_id ?? "",
-        r.profiles?.full_name ?? "",
+        personOf(r)?.full_name ?? "",
         r.students?.departments?.code ?? "",
         fmtTime(r.check_in_at),
         r.check_out_at ? fmtTime(r.check_out_at) : "inside",
@@ -328,7 +353,7 @@ function AttendanceInner() {
       {editing ? (
         <Card className="mt-4 p-4">
           <SectionTitle
-            title={`Correct record — ${editing.profiles?.full_name}`}
+            title={`Correct record — ${nameOf(editing)}`}
             subtitle={`${fmtDate(editing.attendance_date)} · original in ${fmtTime(editing.check_in_at)}`}
             action={<button onClick={() => setEditing(null)} className="text-ink-400 hover:text-white"><X size={15} /></button>}
           />
@@ -386,10 +411,10 @@ function AttendanceInner() {
                   <tr key={r.id} className="border-b border-white/4 last:border-0 hover:bg-white/2">
                     <td className="px-4 py-2.5">
                       <div className="flex items-center gap-2.5">
-                        <Avatar name={r.profiles?.full_name ?? "?"} url={photos[r.student_id]} size={28} />
+                        <Avatar name={personOf(r)?.full_name ?? "?"} url={photos[r.student_id]} size={28} />
                         <div className="min-w-0">
                           <Link href={`/students/${r.student_id}`} className="block truncate font-medium text-white hover:text-mint-300">
-                            {r.profiles?.full_name ?? "—"}
+                            {nameOf(r)}
                           </Link>
                           <p className="truncate font-mono text-[10.5px] text-ink-400">
                             {r.students?.enrollment_id} {r.students?.departments ? `· ${r.students.departments.code}` : ""}

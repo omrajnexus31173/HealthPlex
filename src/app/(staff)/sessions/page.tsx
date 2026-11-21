@@ -24,7 +24,33 @@ type Session = {
   trainers: { profiles: { full_name: string } | { full_name: string }[] | null } | null;
 };
 
-type Booking = { id: string; session_id: string; student_id: string; status: string; profiles: { full_name: string } | { full_name: string }[] | null; students: { enrollment_id: string } | { enrollment_id: string }[] | null };
+type Booking = {
+  id: string;
+  session_id: string;
+  student_id: string;
+  status: string;
+  // session_bookings.student_id → students.id, NOT profiles.id: embedding
+  // profiles:profiles from the booking is a relationship PostgREST cannot resolve
+  // (PGRST200 → HTTP 400 on the whole page). The name is reached through students.
+  students:
+    | { enrollment_id: string; profiles: { full_name: string } | { full_name: string }[] | null }
+    | { enrollment_id: string; profiles: { full_name: string } | { full_name: string }[] | null }[]
+    | null;
+};
+
+/** to-one embeds come back as an object or a one-element array depending on the FK. */
+function unwrap<T>(value: T | T[] | null | undefined): T | null {
+  if (value == null) return null;
+  return Array.isArray(value) ? (value[0] ?? null) : value;
+}
+
+function bookingName(b: Booking): string {
+  return unwrap(unwrap(b.students)?.profiles)?.full_name ?? "Student";
+}
+
+function bookingEnrollment(b: Booking): string {
+  return unwrap(b.students)?.enrollment_id ?? "";
+}
 
 const emptyForm = { title: "", description: "", trainer_id: "", session_date: todayInTz(), start_time: "07:00", end_time: "08:00", capacity: 20, location: "Main Gym Floor" };
 
@@ -53,7 +79,9 @@ function SessionsInner() {
           .order("session_date", { ascending: false })
           .order("start_time")
           .limit(200),
-        supabase.from("session_bookings").select("id, session_id, student_id, status, profiles:profiles(full_name), students:students(enrollment_id)"),
+        supabase
+          .from("session_bookings")
+          .select("id, session_id, student_id, status, students:students!session_bookings_student_id_fkey(enrollment_id, profiles:profiles!students_id_fkey(full_name))"),
         supabase.from("trainers").select("id, profiles:profiles(full_name)"),
       ]);
       if (s.error) throw s.error;
@@ -215,8 +243,8 @@ function SessionsInner() {
                       {sessionBookings.length ? (
                         <div className="mt-2 space-y-1">
                           {sessionBookings.slice(0, 6).map((b) => {
-                            const nm = (Array.isArray(b.profiles) ? b.profiles[0] : b.profiles)?.full_name ?? "Student";
-                            const enr = (Array.isArray(b.students) ? b.students[0] : b.students)?.enrollment_id ?? "";
+                            const nm = bookingName(b);
+                            const enr = bookingEnrollment(b);
                             const done = marked[`${s.id}:${b.student_id}`];
                             return (
                               <div key={b.id} className="flex items-center justify-between gap-2 rounded-lg border border-white/5 bg-navy-950/40 px-2 py-1">

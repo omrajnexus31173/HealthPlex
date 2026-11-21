@@ -61,7 +61,14 @@ type ResultCard = {
   details?: string;
 };
 
-const SCAN_INTERVAL_MS = 420;
+// Sampling cadence. A blink lasts ~150 ms; at 420 ms the detector skips right over it,
+// which is why a genuine user kept failing the blink challenge while their eyes were
+// demonstrably closing. ~180 ms keeps a blink inside the sampled window at ~6 fps of
+// landmark extraction, which any kiosk-class machine sustains.
+const SCAN_INTERVAL_MS = 180;
+const BLINK_SCAN_INTERVAL_MS = 120;
+/** How long the challenge runs before it is scored. */
+const CHALLENGE_MS = 4200;
 
 function KioskInner() {
   const { profile, settings, supabase } = useAuth();
@@ -376,18 +383,18 @@ function KioskInner() {
           setChallengeProgress(0);
           setStatus(CHALLENGE_TEXT[c]);
           setHint("Liveness check keeps photos and screens from marking attendance");
-          window.setTimeout(loop, SCAN_INTERVAL_MS);
+          window.setTimeout(loop, c === "blink" ? BLINK_SCAN_INTERVAL_MS : SCAN_INTERVAL_MS);
           return;
         }
 
         const elapsed = Date.now() - challengeStartRef.current;
         livenessRef.current.push({ landmarks: sample.landmarks, t: Date.now() });
-        const progress = Math.min(100, Math.round((elapsed / 3800) * 100));
-        setChallengeProgress(progress);
+        setChallengeProgress(Math.min(100, Math.round((elapsed / CHALLENGE_MS) * 100)));
+        const cadence = challengeRef.current === "blink" ? BLINK_SCAN_INTERVAL_MS : SCAN_INTERVAL_MS;
 
-        if (elapsed < 3800) {
+        if (elapsed < CHALLENGE_MS) {
           setStatus(CHALLENGE_TEXT[challengeRef.current]);
-          window.setTimeout(loop, SCAN_INTERVAL_MS);
+          window.setTimeout(loop, cadence);
           return;
         }
 
@@ -820,7 +827,10 @@ function KioskInner() {
               <div className="mt-2.5 grid grid-cols-2 gap-2 text-[11px]">
                 <div className="rounded-lg border border-white/6 bg-navy-950/40 p-2">
                   <p className="text-ink-400">Templates</p>
-                  <p className="font-semibold text-white">{templatesRef.current.length}</p>
+                  <p className="font-semibold text-white">
+                    {templatesRef.current.length}
+                    {bundle ? <span className="text-[10px] font-normal text-ink-400"> / {bundle.sync.enrolled_students}</span> : null}
+                  </p>
                 </div>
                 <div className="rounded-lg border border-white/6 bg-navy-950/40 p-2">
                   <p className="text-ink-400">Last sync</p>
@@ -836,6 +846,23 @@ function KioskInner() {
                 </div>
               </div>
               {bundleError ? <p className="mt-2 text-[10.5px] text-[#ffb2a1]">{bundleError}</p> : null}
+              {/* Why the count is what it is — "Templates 0" alone hid a server-side
+                  decryption failure behind what looked like "nobody has enrolled". */}
+              {bundle?.sync.problems.map((p) => (
+                <p key={p} className="mt-2 text-[10.5px] text-warn-400">
+                  {p}
+                </p>
+              ))}
+              {bundle?.sync.excluded.map((e) => (
+                <p key={e.reason} className="mt-1 text-[10px] text-ink-400">
+                  {e.count} × {e.reason}
+                </p>
+              ))}
+              {bundle && bundle.sync.templates_loaded > 0 ? (
+                <p className="mt-2 text-[10px] text-mint-300">
+                  {bundle.sync.templates_loaded} of {bundle.sync.enrolled_students} enrolled students are matchable on this device.
+                </p>
+              ) : null}
               {engineError ? <p className="mt-2 text-[10.5px] text-[#ffb2a1]">Face models: {engineError}</p> : null}
               {!engineReady && !engineError ? (
                 <p className="mt-2 flex items-center gap-1.5 text-[10.5px] text-ink-400">
