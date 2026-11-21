@@ -90,5 +90,59 @@ let ambiguous = false;
 try { byteaToBuffer("deadbeef", "iv", 12); } catch { ambiguous = true; }
 check(ambiguous, "byteaToBuffer rejects a value that cannot be the expected length");
 
+// ---------------------------------------------------------------------------
+// The REAL production row (student 365e70f7-…, captured 2026-11-21), exactly as
+// PostgREST serialised it. This is the case that produced nine
+// kiosk.template_decrypt_failed audit rows and a kiosk stuck on "Templates: 0".
+// Kept verbatim so the failure can never silently return.
+// ---------------------------------------------------------------------------
+const REAL = {
+  iv: "\\x03a6229befd1b1e1400f7533",
+  auth_tag: "\\x14d4c51adea6472a457993961579c00e",
+  ciphertext:
+    "\\x8cc28a0f2166e59e97f1051d234e29a1abe25369632b5494cdee0c024acc994bf1c116230e27c28f0f812efca498d2da29717e9e973a2b64ecfecc52e72bd6b624d3c2fd94abb8a742bdccba16d8051207ce42d1b23f291f06a155fcce830d3eb2af219f8eac18064c5edb92831292d2ae31a663dbc4585a36121760b27988e77fa6ab38ca52f0bcd254beee8551b7bcdb28339b7012bd6724c0f42d3b167c331b8cddf0d943c55397e8caf9a6a61b7e404c0bba503545d204008924bb62f3255cbb403a5d604b5dc986c2f8ace3d92a4f9ee92cf61b6e1a93d98aca2f74156d4dfc9c1bbb8c1ebd42df8a7e17a6266bbde7994eeb563a3f31aea81ee672783a",
+};
+const gcm = (iv, tag) => {
+  const d = crypto.createDecipheriv("aes-256-gcm", Buffer.alloc(32), iv);
+  d.setAuthTag(tag);
+  return d;
+};
+
+check(
+  "real production IV decodes to exactly 12 bytes",
+  byteaToBuffer(REAL.iv, "iv", 12).length === 12,
+  byteaToBuffer(REAL.iv, "iv", 12).toString("hex"),
+);
+check(
+  "real production auth tag decodes to exactly 16 bytes",
+  byteaToBuffer(REAL.auth_tag, "auth_tag", 16).length === 16,
+  `${byteaToBuffer(REAL.auth_tag, "auth_tag", 16).length} bytes`,
+);
+check(
+  "real production ciphertext decodes to exactly 256 bytes",
+  byteaToBuffer(REAL.ciphertext, "ciphertext", 256).length === 256,
+  `${byteaToBuffer(REAL.ciphertext, "ciphertext", 256).length} bytes`,
+);
+check(
+  "the OLD base64-on-hex bug is reproduced, so this regression is real",
+  (() => {
+    try {
+      gcm(Buffer.from(REAL.iv, "base64"), Buffer.from(REAL.auth_tag, "base64"));
+      return false;
+    } catch (e) {
+      return e.message === "Invalid authentication tag length: 24";
+    }
+  })(),
+  'base64-decoding a "\\x"-hex tag throws "Invalid authentication tag length: 24"',
+);
+check(
+  "the real production envelope yields a usable AES-256-GCM decipher",
+  (() => {
+    gcm(byteaToBuffer(REAL.iv, "iv", 12), byteaToBuffer(REAL.auth_tag, "auth_tag", 16));
+    return true;
+  })(),
+  "envelope accepted: 12/16/256",
+);
+
 console.log(`\n${pass}/${pass + fail} checks passed`);
 process.exit(fail === 0 ? 0 : 1);
