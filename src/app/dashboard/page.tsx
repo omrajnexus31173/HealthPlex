@@ -8,16 +8,20 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   CalendarClock,
+  CheckCircle2,
+  Clock,
   Dumbbell,
+  Percent,
   ScanFace,
   TrendingUp,
   Users,
   UserCheck,
+  XCircle,
 } from "lucide-react";
 import { Shell } from "@/components/Shell";
 import { StaffGuard } from "@/components/StaffGuard";
 import { useAuth } from "@/components/AuthProvider";
-import { Alert, Avatar, Card, CapacityBar, Chip, EmptyState, SectionTitle, Skeleton, StatCard } from "@/components/ui";
+import { Alert, Avatar, Card, CapacityBar, Chip, EmptyState, Progress, SectionTitle, Skeleton, StatCard } from "@/components/ui";
 import { AreaChart, BarsChart, Donut } from "@/components/Charts";
 import { fmtClock, fmtTime, percent, timeAgo } from "@/lib/format";
 import type { DashboardStats, TrainingSession } from "@/lib/types";
@@ -35,6 +39,12 @@ type FeedRow = {
   department: string | null;
   entry_source: string;
 };
+type Monthly = { year: number; month: number; total_visits: number; unique_students: number };
+type DeptAtt = { department: string; code: string; students: number; present_days: number; absent_days: number; attendance_pct: number | null };
+type LowAttendance = { student_id: string; full_name: string; enrollment_id: string; department: string; present_days: number; eligible_days: number; attendance_pct: number | null };
+type AttToday = { date: string; is_operating_day: boolean; eligible_students: number; present: number; absent: number; incomplete: number; attendance_pct: number | null };
+type AttMonth = { year: number; month: number; from: string; to: string; eligible_days: number; present_student_days: number; attendance_pct: number | null; total_visits: number; avg_visit_minutes: number | null };
+type DashAttendance = { timezone: string; generated_at: string; eligible_students: number; today: AttToday; month: AttMonth; departments: DeptAtt[]; low_attendance: LowAttendance[] };
 type Alertish = { id: string; title: string; body: string | null; severity: string; created_at: string; link: string | null };
 
 function DashboardInner() {
@@ -47,6 +57,8 @@ function DashboardInner() {
   const [sessions, setSessions] = useState<TrainingSession[]>([]);
   const [equipment, setEquipment] = useState<{ total: number; down: number; faults: number }>({ total: 0, down: 0, faults: 0 });
   const [alerts, setAlerts] = useState<Alertish[]>([]);
+  const [att, setAtt] = useState<DashAttendance | null>(null);
+  const [monthly, setMonthly] = useState<Monthly[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [clock, setClock] = useState(() => new Date());
@@ -54,7 +66,7 @@ function DashboardInner() {
   const load = useCallback(async () => {
     try {
       setError(null);
-      const [s, t, d, p, f, ses, eq, al] = await Promise.all([
+      const [s, t, d, p, f, ses, eq, al, attRes, mRes] = await Promise.all([
         supabase.rpc("dashboard_stats"),
         supabase.rpc("attendance_trend", { p_days: 14 }),
         supabase.rpc("department_stats", { p_days: 30 }),
@@ -70,9 +82,13 @@ function DashboardInner() {
           .limit(5),
         supabase.from("equipment").select("status"),
         supabase.from("notifications").select("id,title,body,severity,created_at,link").order("created_at", { ascending: false }).limit(6),
+        supabase.rpc("attendance_dashboard_stats"),
+        supabase.from("attendance_monthly_summary").select("year,month,total_visits,unique_students").order("year", { ascending: false }).order("month", { ascending: false }).limit(6),
       ]);
       if (s.error) throw s.error;
       setStats(s.data as DashboardStats);
+      setAtt((attRes.data as DashAttendance | null) ?? null);
+      setMonthly(((mRes.data as Monthly[]) ?? []).map((r) => ({ ...r, total_visits: Number(r.total_visits), unique_students: Number(r.unique_students) })).reverse());
       setTrend(((t.data as Trend[]) ?? []).map((r) => ({ ...r, visits: Number(r.visits), unique_students: Number(r.unique_students) })));
       setDepts(((d.data as DeptRow[]) ?? []).map((r) => ({ ...r, visits: Number(r.visits), students: Number(r.students) })));
       setPeaks(((p.data as { hour: number; visits: number }[]) ?? []).map((r) => ({ hour: Number(r.hour), visits: Number(r.visits) })));
@@ -166,6 +182,133 @@ function DashboardInner() {
           icon={<TrendingUp size={16} />}
           loading={loading}
         />
+      </div>
+
+      {/* ---------- Attendance intelligence (month to date, all from live DB) ---------- */}
+      <div className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <StatCard
+          label="Eligible students"
+          value={att?.eligible_students ?? "—"}
+          hint="active, not deleted"
+          icon={<Users size={16} />}
+          loading={loading}
+        />
+        <StatCard
+          label={att?.today.is_operating_day === false ? "Gym closed today" : "Present today"}
+          value={att?.today.is_operating_day === false ? "—" : att?.today.present ?? "—"}
+          hint={
+            att == null
+              ? "awaiting data"
+              : att.today.is_operating_day
+                ? `${att.today.absent} absent · ${att.today.incomplete} pending resolution`
+                : "non-operating day / weekly off"
+          }
+          icon={<CheckCircle2 size={16} />}
+          tone="mint"
+          loading={loading}
+        />
+        <StatCard
+          label="Absent today"
+          value={att?.today.is_operating_day === false ? "—" : att?.today.absent ?? "—"}
+          hint="no verified visit of 30+ min"
+          icon={<XCircle size={16} />}
+          loading={loading}
+        />
+        <StatCard
+          label="Month attendance"
+          value={att?.month.attendance_pct == null ? (loading ? "—" : "N/A") : `${att.month.attendance_pct}%`}
+          hint={att ? `${att.month.eligible_days} operating days elapsed` : "month to date"}
+          icon={<Percent size={16} />}
+          loading={loading}
+        />
+      </div>
+
+      <div className="mt-4 grid gap-4 xl:grid-cols-3">
+        <Card className="p-4">
+          <SectionTitle
+            title="Department-wise attendance"
+            subtitle="Present student-days ÷ eligible days · month to date"
+          />
+          {loading ? (
+            <Skeleton className="h-36" />
+          ) : !att || att.departments.length === 0 ? (
+            <p className="py-6 text-center text-[11.5px] text-ink-400">No departments or attendance yet.</p>
+          ) : (
+            <ul className="mt-2 space-y-2.5">
+              {att.departments.map((d) => (
+                <li key={`${d.department}-${d.code}`}>
+                  <div className="mb-1 flex items-baseline justify-between gap-2 text-[11.5px]">
+                    <span className="truncate font-medium text-white">{d.department}</span>
+                    <span className="shrink-0 text-ink-400">
+                      {d.present_days}/{d.students * (att.month.eligible_days || 0)} ·{" "}
+                      <b className="text-mint-300">{d.attendance_pct == null ? "N/A" : `${d.attendance_pct}%`}</b>
+                    </span>
+                  </div>
+                  <Progress value={d.attendance_pct ?? 0} tone={d.attendance_pct == null ? "warn" : d.attendance_pct >= 75 ? "mint" : d.attendance_pct >= 50 ? "warn" : "danger"} />
+                </li>
+              ))}
+            </ul>
+          )}
+        </Card>
+
+        <Card className="p-4">
+          <SectionTitle
+            title="Low attendance"
+            subtitle="Below 50% this month · needs a nudge"
+            action={
+              profile?.role === "super_admin" || profile?.role === "gym_admin" ? (
+                <Link href="/attendance/reports" className="text-[11px] font-semibold text-mint-300 hover:underline">
+                  full report →
+                </Link>
+              ) : null
+            }
+          />
+          {loading ? (
+            <Skeleton className="h-36" />
+          ) : !att || att.low_attendance.length === 0 ? (
+            <p className="py-6 text-center text-[11.5px] text-ink-400">No students below 50% this month. Well done.</p>
+          ) : (
+            <ul className="mt-2 divide-y divide-white/5">
+              {att.low_attendance.slice(0, 5).map((s) => (
+                <li key={s.student_id} className="flex items-center gap-2.5 py-2">
+                  <Avatar name={s.full_name} size={28} />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-[12px] font-medium text-white">{s.full_name}</p>
+                    <p className="truncate text-[10px] text-ink-400">{s.enrollment_id} · {s.department}</p>
+                  </div>
+                  <Chip tone="red">{s.attendance_pct == null ? "N/A" : `${s.attendance_pct}%`}</Chip>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Card>
+
+        <Card className="p-4">
+          <SectionTitle title="Monthly frequency" subtitle="Resolved visits & unique students per month" />
+          {loading ? (
+            <Skeleton className="h-36" />
+          ) : monthly.length === 0 ? (
+            <p className="py-6 text-center text-[11.5px] text-ink-400">Monthly summaries appear after the first completed month.</p>
+          ) : (
+            <ul className="mt-2 space-y-1.5">
+              {monthly.map((m) => (
+                <li key={`${m.year}-${m.month}`} className="flex items-center justify-between rounded-lg border border-white/6 bg-navy-950/40 px-3 py-2 text-[11.5px]">
+                  <span className="font-medium text-white">{new Date(m.year, m.month - 1, 1).toLocaleDateString("en-IN", { month: "short", year: "numeric" })}</span>
+                  <span className="text-ink-400">{m.total_visits} visits · {m.unique_students} unique</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="mt-3 flex items-center justify-between rounded-xl border border-mint-500/15 bg-mint-500/5 px-3 py-2.5">
+            <div>
+              <p className="text-[10.5px] uppercase tracking-wider text-ink-400">Average visit (month)</p>
+              <p className="mt-0.5 text-lg font-semibold text-white">
+                {att?.month.avg_visit_minutes == null ? "—" : `${att.month.avg_visit_minutes.toFixed(1)} min`}
+              </p>
+            </div>
+            <Clock size={18} className="text-mint-300" />
+          </div>
+        </Card>
       </div>
 
       <div className="mt-4 grid gap-4 xl:grid-cols-[1.55fr_1fr]">

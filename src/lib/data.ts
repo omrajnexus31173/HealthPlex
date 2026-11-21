@@ -2,6 +2,10 @@
 
 import { createClient } from "@/lib/supabase/client";
 
+export { csvEscape, downloadCsv, parseCsv, toCsv } from "@/lib/csv";
+export { exportAttendancePdf, buildAttendancePdf } from "@/lib/pdf";
+export type { PdfTableOptions } from "@/lib/pdf";
+
 export type StudentRow = {
   id: string;
   enrollment_id: string;
@@ -54,99 +58,4 @@ export async function uploadStudentPhoto(studentId: string, file: File): Promise
   });
   if (error) throw new Error(error.message);
   return path;
-}
-
-export function csvEscape(value: unknown): string {
-  const s = value == null ? "" : String(value);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
-
-export function downloadCsv(filename: string, rows: (string | number | null | undefined)[][]) {
-  const csv = rows.map((r) => r.map(csvEscape).join(",")).join("\n");
-  const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-export function parseCsv(text: string): Record<string, string>[] {
-  const lines = text.replace(/\r\n/g, "\n").split("\n").filter((l) => l.trim().length);
-  if (lines.length < 2) return [];
-  const split = (line: string) => {
-    const out: string[] = [];
-    let cur = "";
-    let quoted = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (quoted) {
-        if (ch === '"' && line[i + 1] === '"') {
-          cur += '"';
-          i++;
-        } else if (ch === '"') quoted = false;
-        else cur += ch;
-      } else if (ch === '"') quoted = true;
-      else if (ch === ",") {
-        out.push(cur);
-        cur = "";
-      } else cur += ch;
-    }
-    out.push(cur);
-    return out.map((v) => v.trim());
-  };
-  const header = split(lines[0]).map((h) => h.toLowerCase().replace(/\s+/g, "_"));
-  return lines.slice(1).map((line) => {
-    const cells = split(line);
-    const row: Record<string, string> = {};
-    header.forEach((h, i) => (row[h] = cells[i] ?? ""));
-    return row;
-  });
-}
-
-export async function exportAttendancePdf(opts: {
-  title: string;
-  subtitle: string;
-  columns: string[];
-  rows: (string | number | null)[][];
-  filename: string;
-}) {
-  const { default: JsPDF } = await import("jspdf");
-  await import("jspdf-autotable");
-  const doc = new JsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
-  doc.setFillColor(5, 11, 28);
-  doc.rect(0, 0, doc.internal.pageSize.getWidth(), 68, "F");
-  doc.setTextColor(79, 224, 162);
-  doc.setFontSize(17);
-  doc.text("HEALTHPLEX", 40, 30);
-  doc.setTextColor(232, 238, 249);
-  doc.setFontSize(9.5);
-  doc.text("GSFC University · Smart University Gym Management System", 40, 46);
-  doc.setTextColor(255, 255, 255);
-  doc.setFontSize(12);
-  doc.text(opts.title, 40, 62);
-  doc.setTextColor(90, 105, 130);
-  doc.setFontSize(8.5);
-  doc.text(opts.subtitle, 40, 84);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (doc as any).autoTable({
-    head: [opts.columns],
-    body: opts.rows.map((r) => r.map((c) => (c == null ? "—" : String(c)))),
-    startY: 96,
-    styles: { fontSize: 7.6, cellPadding: 4, textColor: [30, 40, 55] },
-    headStyles: { fillColor: [12, 34, 28], textColor: [142, 240, 196], fontStyle: "bold" },
-    alternateRowStyles: { fillColor: [244, 248, 246] },
-    margin: { left: 40, right: 40 },
-  });
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const finalY = ((doc as any).lastAutoTable?.finalY as number) ?? 120;
-  doc.setTextColor(120, 130, 145);
-  doc.setFontSize(7.5);
-  doc.text(
-    `Generated ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST · HEALTHPLEX · GSFC University`,
-    40,
-    Math.min(finalY + 20, doc.internal.pageSize.getHeight() - 20),
-  );
-  doc.save(opts.filename);
 }

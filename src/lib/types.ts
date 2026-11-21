@@ -82,6 +82,7 @@ export type GymSettings = {
   booking_enabled: boolean;
   opening_hours: Record<string, string>;
   capacity_alerts: boolean;
+  min_presence_minutes: number;
   retention_months: number;
   retention_enabled: boolean;
   retention_armed: boolean;
