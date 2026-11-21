@@ -128,8 +128,11 @@ export function EnrollWizard({
   const withdraw = async () => {
     if (!window.confirm("Withdraw consent and permanently delete the biometric template? Attendance will then require ID verification at the desk.")) return;
     try {
-      await apiFetch("/api/admin/face/enroll", {
-        method: "DELETE",
+      // students have no privilege to revoke biometrics themselves, so their request
+      // goes through a dedicated self-service route; staff use the admin endpoint
+      const path = self ? "/api/me/withdraw-consent" : "/api/admin/face/enroll";
+      await apiFetch(path, {
+        method: path === "/api/me/withdraw-consent" ? "POST" : "DELETE",
         body: JSON.stringify({ student_id: studentId, reason: "Consent withdrawn by student/administrator" }),
       });
       onWithdraw?.();

@@ -205,7 +205,7 @@ create trigger students_guard before update on students for each row execute fun
 -- =================================================== kiosk RPC (device keyed)
 create or replace function kiosk_students(p_code text)
 returns table (student_id uuid, full_name text, enrollment_id text, photo_path text, account_status account_status, face_enrolled boolean, has_template boolean)
-language plpgsql stable security definer set search_path = public as $$
+language plpgsql volatile security definer set search_path = public as $$
 declare v_device uuid;
 begin
   select id into v_device from kiosk_devices
@@ -241,7 +241,7 @@ create or replace function kiosk_scan(
 returns jsonb language plpgsql security definer set search_path = public as $$
 declare
   v_device uuid; v_settings gym_settings; v_profile profiles; v_student students;
-  v_open attendance_records; v_last attendance_records; v_now timestamptz := now();
+  v_open attendance_records; v_last attendance_records; v_now timestamptz := clock_timestamp();
   v_date date; v_action text; v_rec attendance_records; v_inside integer;
 begin
   select * into v_settings from gym_settings where id;
@@ -270,15 +270,19 @@ begin
    where student_id = p_student and check_out_at is null and status = 'present'
    order by check_in_at desc limit 1;
 
-  -- duplicate-scan cooldown
+  -- duplicate-scan cooldown. The kiosk auto-detects, so a student who lingers in front
+  -- of the camera would otherwise create repeated entry records. A scan always closes
+  -- an open record (check-out) immediately; a *new* entry is throttled for
+  -- cooldown_minutes after the previous visit. The window is configurable in settings.
   select * into v_last from attendance_records
-   where student_id = p_student order by check_in_at desc limit 1;
-  if v_last.id is not null and v_last.check_in_at > v_now - make_interval(mins => v_settings.cooldown_minutes)
-     and v_open.id is null then
+   where student_id = p_student
+   order by check_in_at desc limit 1;
+  if v_open.id is null and v_last.id is not null
+     and v_last.check_in_at > v_now - make_interval(mins => v_settings.cooldown_minutes) then
     insert into attendance_attempts (student_id, device_id, result, confidence, liveness_score, faces_detected, reason)
-    values (p_student, v_device, 'cooldown', p_confidence, p_liveness, p_faces, 'within cooldown window');
+    values (p_student, v_device, 'cooldown', p_confidence, p_liveness, p_faces, 're-entry within cooldown window');
     return jsonb_build_object('status','cooldown',
-      'message','Attendance already recorded. Please wait before scanning again.',
+      'message','Your last visit was just recorded. Please wait a moment before scanning in again.',
       'student', jsonb_build_object('id',v_profile.id,'name',v_profile.full_name,'enrollment',v_student.enrollment_id,'photo_path',v_student.photo_path),
       'record', to_jsonb(v_last));
   end if;

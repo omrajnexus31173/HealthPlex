@@ -27,6 +27,15 @@ export async function middleware(request: NextRequest) {
   const path = request.nextUrl.pathname;
   const isPublic = PUBLIC_PATHS.some((p) => path === p || path.startsWith(p + "/"));
 
+  // Internal API routes authenticate themselves and answer with JSON (401/403).
+  // Letting the middleware HTML-redirect them would break fetch() callers, so they
+  // are left to the route handlers — except the privileged admin surface, which is
+  // additionally gated on the cookie session for defence in depth.
+  if (path.startsWith("/api/")) {
+    if (!user && path.startsWith("/api/admin/")) return NextResponse.json({ error: "Authentication required" }, { status: 401 });
+    return response;
+  }
+
   if (!user && !isPublic) {
     const redirect = request.nextUrl.clone();
     redirect.pathname = "/login";
