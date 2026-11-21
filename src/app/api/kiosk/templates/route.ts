@@ -65,17 +65,19 @@ export async function POST(request: NextRequest) {
 
   const templates: { student_id: string; descriptor: string; version: string }[] = [];
   const failures: string[] = [];
+  const failureReasons: { student_id: string; error: string }[] = [];
   for (const row of rows ?? []) {
     if (!eligible.has(row.student_id)) continue;
     try {
-      const descriptor = decryptDescriptor(row as { ciphertext: string; iv: string; auth_tag: string });
+      const descriptor = decryptDescriptor(row);
       templates.push({
         student_id: row.student_id,
         descriptor: Buffer.from(new Float32Array(descriptor).buffer).toString("base64"),
         version: row.descriptor_version,
       });
-    } catch {
+    } catch (e) {
       failures.push(row.student_id);
+      failureReasons.push({ student_id: row.student_id, error: e instanceof Error ? e.message : "decrypt failed" });
     }
   }
 
@@ -96,7 +98,7 @@ export async function POST(request: NextRequest) {
       actor_role: ctx.profile.role,
       action: "kiosk.template_decrypt_failed",
       entity: "face_templates",
-      after: { students: failures },
+      after: { students: failures, reasons: failureReasons.map((f) => f.error) },
     });
   }
 
@@ -113,6 +115,8 @@ export async function POST(request: NextRequest) {
       };
     }),
     templates,
+    // the kiosk shows "Templates N" and must be able to say why a template is missing
+    template_failures: failures,
     signed_photo_urls: signed,
     config: {
       recognition_threshold: Number(settings?.recognition_threshold ?? 0.48),

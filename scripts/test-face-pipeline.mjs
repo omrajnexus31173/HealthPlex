@@ -171,28 +171,26 @@ if (enrolA.length === 1 && sessionB.length === 1 && impostor.length === 1) {
   console.log(`  threshold margin: ${(impostorDist - genuineDist).toFixed(3)} (decision gap)`);
 }
 
-// --- liveness logic (identical maths to engine.scoreLiveness) ---------------
-const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-const eyeAspect = (eye) => ((dist(eye[1], eye[5]) + dist(eye[2], eye[4])) / 2) / (dist(eye[0], eye[3]) || 1);
+// --- liveness: the REAL scorer, never a re-implementation -------------------
+// This harness used to duplicate the maths, which meant it could stay green while the
+// shipped scorer behaved differently. It now imports src/lib/face/engine.ts directly.
+const { scoreLiveness } = await import("../src/lib/face/engine.ts");
 
-function liveness(samples) {
-  const ears = [];
-  const yaws = [];
-  for (const s of samples) {
-    if (s.length < 68) continue;
-    ears.push((eyeAspect(s.slice(36, 42)) + eyeAspect(s.slice(42, 48))) / 2);
-    const midX = (s[0].x + s[16].x) / 2;
-    const w = dist(s[0], s[16]) || 1;
-    yaws.push((s[30].x - midX) / w);
-  }
-  if (!ears.length) return { score: 0 };
-  const minEar = Math.min(...ears);
-  const maxEar = Math.max(...ears);
-  const yawSpan = Math.max(...yaws) - Math.min(...yaws);
-  const geometry = Math.min(1, Math.max(0, (maxEar - minEar - 0.035) / 0.09));
-  const motion = Math.min(1, yawSpan / 0.05);
-  const stable = yawSpan > 0.35 ? 0.2 : 1;
-  return { score: geometry * 0.45 + motion * 0.2 + stable * 0.15, geometry, motion, yawSpan };
+/**
+ * Wrap landmark arrays as timestamped frames. The scorer needs real timing to reason
+ * about whether a blink was even observable, so frames are spread 200 ms apart (a real
+ * kiosk samples every ~420 ms) instead of all sharing one instant.
+ */
+function liveness(frames, challenge = "blink", stepMs = 200) {
+  const samples = frames.map((landmarks, i) => ({ landmarks, t: i * stepMs }));
+  const r = scoreLiveness(samples, challenge);
+  return {
+    score: r.score,
+    geometry: Number(r.detail.blink ?? 0),
+    motion: Number(r.detail.motion ?? 0),
+    yawSpan: Number(r.detail.yawSpan ?? 0),
+    reason: r.reason,
+  };
 }
 
 const base = enrolA[0].landmarks.positions.map((p) => ({ x: p.x, y: p.y }));
@@ -243,7 +241,8 @@ check(
 check(
   "Combined live sequence passes the configured 0.60 liveness threshold",
   (() => {
-    const live = liveness(blinkFrames.map((f) => f));
+    // a real session mixes both kinds of evidence: eyelids and head movement
+    const live = liveness(blinkFrames.map((f, i) => (i % 2 === 0 ? f : turnFrames[i])));
     return live.score >= 0.6;
   })(),
   `score ${liveness(blinkFrames.map((f, i) => (i % 2 === 0 ? f : turnFrames[i]))).score.toFixed(3)}`,

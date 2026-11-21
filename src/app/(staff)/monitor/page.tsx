@@ -29,9 +29,25 @@ type InsideRow = {
   student_id: string;
   check_in_at: string;
   duration_minutes: number | null;
-  profiles: { full_name: string } | null;
-  students: { enrollment_id: string; photo_path: string | null } | null;
+  students: {
+    enrollment_id: string;
+    photo_path: string | null;
+    profiles: { full_name: string } | { full_name: string }[] | null;
+  } | null;
 };
+
+/**
+ * attendance_records.student_id references students, not profiles, so the old embed
+ * `profiles:profiles!attendance_records_student_id_fkey` asked PostgREST for a
+ * relationship that does not exist. It answered 400 and "currently inside" was
+ * silently always empty on the live monitor. The name now comes through
+ * students → profiles, which is a real FK (students_id_fkey).
+ */
+function insideName(row: InsideRow): string {
+  const p = row.students?.profiles;
+  const profile = Array.isArray(p) ? (p[0] ?? null) : p;
+  return profile?.full_name ?? "Student";
+}
 
 function MonitorInner() {
   const { settings, supabase } = useAuth();
@@ -54,7 +70,7 @@ function MonitorInner() {
         client.rpc("live_feed", { p_limit: 25 }),
         client
           .from("attendance_records")
-          .select("id, student_id, check_in_at, duration_minutes, profiles:profiles!attendance_records_student_id_fkey(full_name), students:students!attendance_records_student_id_fkey(enrollment_id, photo_path)")
+          .select("id, student_id, check_in_at, duration_minutes, students:students!attendance_records_student_id_fkey(enrollment_id, photo_path, profiles:profiles!students_id_fkey(full_name))")
           .is("check_out_at", null)
           .eq("status", "present")
           .order("check_in_at", { ascending: false }),
@@ -144,9 +160,9 @@ function MonitorInner() {
               <div className="max-h-[300px] space-y-1 overflow-y-auto pr-1">
                 {inside.map((r) => (
                   <div key={r.id} className="flex items-center gap-2.5 rounded-xl border border-white/5 bg-navy-950/40 px-2.5 py-1.5">
-                    <Avatar name={r.profiles?.full_name ?? "?"} url={photos[r.student_id]} size={28} />
+                    <Avatar name={insideName(r)} url={photos[r.student_id]} size={28} />
                     <div className="min-w-0 flex-1">
-                      <p className="truncate text-[12px] font-medium text-white">{r.profiles?.full_name}</p>
+                      <p className="truncate text-[12px] font-medium text-white">{insideName(r)}</p>
                       <p className="truncate font-mono text-[10px] text-ink-400">{r.students?.enrollment_id}</p>
                     </div>
                     <div className="text-right">

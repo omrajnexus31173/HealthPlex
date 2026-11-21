@@ -39,17 +39,83 @@ export function encryptDescriptor(descriptor: Float32Array): EncryptedTemplate {
   };
 }
 
-export function decryptDescriptor(row: { ciphertext: string; iv: string; auth_tag?: string; authTag?: string; dimension?: number }): Float32Array {
+export const TEMPLATE_IV_BYTES = 12;
+export const TEMPLATE_TAG_BYTES = 16;
+export const TEMPLATE_CIPHERTEXT_BYTES = 256;
+
+/**
+ * Decode a `bytea` column into bytes, tolerating every shape it can arrive in.
+ *
+ * PostgREST returns `bytea` as a Postgres *text* literal, i.e. `\\x8cc28a0f...`. The
+ * original code stripped that prefix for the ciphertext but not for `iv`/`auth_tag`,
+ * so the 16-byte GCM tag was base64-decoded from a hex string into 20 bytes and every
+ * decryption died with "Invalid authentication tag length: 20". In production that
+ * surfaced as a kiosk showing "Templates: 0" with `kiosk.template_decrypt_failed`
+ * audit rows, while the template itself was perfectly valid.
+ *
+ * `expectedLength` makes the parse deterministic instead of heuristic: candidates are
+ * tried and exactly one must produce the right number of bytes. Accepted forms:
+ * Buffer/Uint8Array, `\\x`+hex, bare hex, base64, or a JSON byte array.
+ */
+export function byteaToBuffer(value: unknown, field: string, expectedLength?: number): Buffer {
+  const candidates: Buffer[] = [];
+  const add = (b: Buffer) => {
+    if (expectedLength == null || b.length === expectedLength) candidates.push(b);
+  };
+
+  if (Buffer.isBuffer(value)) add(value);
+  else if (value instanceof Uint8Array) add(Buffer.from(value));
+  else if (Array.isArray(value)) add(Buffer.from(value.map((n) => Number(n) & 0xff)));
+  else if (typeof value === "string") {
+    if (value.startsWith("\\x")) {
+      const hex = value.slice(2);
+      if (hex.length % 2 !== 0 || /[^0-9a-fA-F]/.test(hex)) throw new Error(`${field} has an invalid hex literal`);
+      add(Buffer.from(hex, "hex"));
+    } else {
+      // PostgREST has been known to drop the prefix; try hex, then base64
+      if (/^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0) add(Buffer.from(value, "hex"));
+      add(Buffer.from(value, "base64"));
+    }
+  } else {
+    throw new Error(`${field} is not bytea-like (${typeof value})`);
+  }
+
+  if (candidates.length === 0) {
+    const hint = expectedLength == null ? "" : ` (expected ${expectedLength} bytes)`;
+    throw new Error(`${field} did not decode to a valid bytea value${hint}`);
+  }
+  // prefer the first candidate: prefix-aware hex beats base64, matching PostgREST
+  const chosen = candidates[0];
+  if (candidates.some((c) => !c.equals(chosen))) {
+    throw new Error(`${field} is ambiguous: hex and base64 interpretations differ`);
+  }
+  return chosen;
+}
+
+export function decryptDescriptor(row: {
+  ciphertext: unknown;
+  iv: unknown;
+  auth_tag?: unknown;
+  authTag?: unknown;
+  dimension?: number;
+}): Float32Array {
   const tag = row.auth_tag ?? row.authTag;
-  if (!tag) throw new Error("missing auth tag");
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key(), Buffer.from(row.iv, "base64"));
-  decipher.setAuthTag(Buffer.from(tag, "base64"));
-  // Supabase returns bytea as \x-hex strings
-  const ctRaw = row.ciphertext.startsWith("\\x")
-    ? Buffer.from(row.ciphertext.slice(2), "hex")
-    : Buffer.from(row.ciphertext, "base64");
-  const plain = Buffer.concat([decipher.update(ctRaw), decipher.final()]);
-  const dim = Math.floor(plain.length / 2);
+  if (tag == null) throw new Error("missing auth tag");
+
+  const ivBytes = byteaToBuffer(row.iv, "iv", TEMPLATE_IV_BYTES);
+  const tagBytes = byteaToBuffer(tag, "auth_tag", TEMPLATE_TAG_BYTES);
+  const ctBytes = byteaToBuffer(row.ciphertext, "ciphertext", TEMPLATE_CIPHERTEXT_BYTES);
+
+  // fail with a precise message instead of an opaque crypto error
+  if (ivBytes.length !== TEMPLATE_IV_BYTES) throw new Error(`iv must be ${TEMPLATE_IV_BYTES} bytes, got ${ivBytes.length}`);
+  if (tagBytes.length !== TEMPLATE_TAG_BYTES) throw new Error(`auth_tag must be ${TEMPLATE_TAG_BYTES} bytes, got ${tagBytes.length}`);
+  if (ctBytes.length !== TEMPLATE_CIPHERTEXT_BYTES) throw new Error(`ciphertext must be ${TEMPLATE_CIPHERTEXT_BYTES} bytes, got ${ctBytes.length}`);
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key(), ivBytes);
+  decipher.setAuthTag(tagBytes);
+  const plain = Buffer.concat([decipher.update(ctBytes), decipher.final()]);
+  const dim = plain.length / 2;
+  if (!Number.isInteger(dim) || dim !== 128) throw new Error(`descriptor must be 128-D, got ${dim}`);
   const out = new Float32Array(dim);
   for (let i = 0; i < dim; i++) out[i] = plain.readInt16LE(i * 2) / 32000;
   return out;

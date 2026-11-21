@@ -36,7 +36,29 @@ export type KioskStudentRow = {
   has_template: boolean;
 };
 
+/**
+ * Load the roster + decrypted descriptors for a paired kiosk.
+ *
+ * `sync` explains the template count instead of silently showing "Templates 0": the
+ * kiosk previously reported zero even when a valid template existed, because the
+ * server could not decrypt it, and the screen gave no way to tell that apart from
+ * "nobody has enrolled". Every count now says which stage it was lost at.
+ */
+export type TemplateSyncReport = {
+  /** students whose account is active, consented and not deleted */
+  enrolled_students: number;
+  /** descriptors the server successfully decrypted and sent */
+  templates_received: number;
+  /** descriptors this client accepted (right model version + decodable) */
+  templates_loaded: number;
+  /** distinct reasons a student's template did not reach the matcher */
+  excluded: { reason: string; count: number }[];
+  problems: string[];
+};
+
 export type TemplateBundle = {
+  /** where each template got to on the way to the matcher */
+  sync: TemplateSyncReport;
   students: KioskStudentRow[];
   templates: EnrolledTemplate[];
   config: {
@@ -88,13 +110,49 @@ export async function fetchTemplates(code: string): Promise<TemplateBundle> {
     config: TemplateBundle["config"];
     server_time: string;
     signed_photo_urls: Record<string, string>;
+    /** server-side reasons, e.g. undecryptable templates */
+    template_failures?: string[];
   }>("/api/kiosk/templates", { code });
 
-  const templates: EnrolledTemplate[] = raw.templates
-    .filter((t) => t.version === DESCRIPTOR_VERSION)
-    .map((t) => ({ student_id: t.student_id, descriptor: base64ToDescriptor(t.descriptor), version: t.version }));
+  const loaded: EnrolledTemplate[] = [];
+  let versionMismatch = 0;
+  let undecodable = 0;
+  for (const t of raw.templates) {
+    if (t.version !== DESCRIPTOR_VERSION) {
+      versionMismatch++;
+      continue;
+    }
+    try {
+      loaded.push({ student_id: t.student_id, descriptor: base64ToDescriptor(t.descriptor), version: t.version });
+    } catch {
+      undecodable++;
+    }
+  }
 
-  return { ...raw, templates };
+  const enrolled = raw.students.length;
+  const serverFailures = raw.template_failures?.length ?? 0;
+  const excluded: { reason: string; count: number }[] = [];
+  if (serverFailures) excluded.push({ reason: "template could not be decrypted on the server", count: serverFailures });
+  if (versionMismatch) excluded.push({ reason: `descriptor model mismatch (expected ${DESCRIPTOR_VERSION})`, count: versionMismatch });
+  if (undecodable) excluded.push({ reason: "descriptor payload was malformed", count: undecodable });
+  const missing = Math.max(0, enrolled - raw.templates.length - serverFailures);
+  if (missing) excluded.push({ reason: "enrolled student has no usable template", count: missing });
+
+  const problems: string[] = [];
+  if (enrolled === 0) problems.push("No consenting student with an enrolled face yet — enrol a face in Students → Face enrolment.");
+  else if (loaded.length === 0) problems.push("Students are enrolled but their templates did not load — see the reasons below.");
+
+  return {
+    ...raw,
+    templates: loaded,
+    sync: {
+      enrolled_students: enrolled,
+      templates_received: raw.templates.length,
+      templates_loaded: loaded.length,
+      excluded,
+      problems,
+    },
+  };
 }
 
 export type ScanResponse = {

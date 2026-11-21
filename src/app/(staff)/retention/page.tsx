@@ -39,15 +39,23 @@ function RetentionInner() {
   const [approval, setApproval] = useState("");
   const [tab, setTab] = useState<"policy" | "history" | "summaries" | "backups">("policy");
   const [preview, setPreview] = useState<{ candidates: number; cutoff: string } | null>(null);
+  const [cron, setCron] = useState<{ jobid: number; schedule: string; active: boolean }[]>([]);
 
   const load = useCallback(async () => {
     try {
       setError(null);
-      const res = await apiFetch<{ status: RetentionStatus; runs: CleanupRun[]; summaries: Summary[]; backups: Backup[] }>("/api/admin/retention");
+      const res = await apiFetch<{
+        status: RetentionStatus;
+        runs: CleanupRun[];
+        summaries: Summary[];
+        backups: Backup[];
+        cron?: { jobid: number; schedule: string; active: boolean }[];
+      }>("/api/admin/retention");
       setStatus(res.status);
       setRuns(res.runs);
       setSummaries(res.summaries);
       setBackups(res.backups);
+      setCron(res.cron ?? []);
       setApproval(res.status.approved_by ?? "");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unable to load retention status");
@@ -165,7 +173,7 @@ function RetentionInner() {
               <div className="text-[11.5px] leading-relaxed text-ink-400">
                 <p className="font-semibold text-white">Destructive cleanup is disabled until GSFC University approves the policy.</p>
                 <p className="mt-0.5">
-                  The monthly scheduled job (pg_cron, 1st of every month, 02:30 IST) checks <span className="text-white">retention_enabled + retention_armed</span> before
+                  The monthly scheduled job (pg_cron, 21:00 IST on the last day of the month) checks <span className="text-white">retention_enabled + retention_armed</span> before
                   doing anything. Even when armed, every execution writes a verified JSON backup and generates the monthly summaries
                   in the same transaction <em>before</em> deleting a single row. Student profiles, active accounts, enrollment IDs,
                   roles, biometric templates, gym configuration, staff, equipment and audit records are never touched.
@@ -291,7 +299,15 @@ function RetentionInner() {
 
                   <div className="rounded-xl border border-white/6 bg-navy-950/40 p-3 text-[10.5px] leading-relaxed text-ink-400">
                     <p className="mb-1 font-semibold text-white">Schedule</p>
-                    <p>pg_cron job <span className="font-mono">healthplex-monthly-attendance-retention</span> · next run {fmtDateTime(status.next_scheduled)}</p>
+                    <p>
+                      pg_cron job <span className="font-mono">healthplex-monthly-attendance-retention</span>
+                      {cron.length ? (
+                        <> · schedule <span className="font-mono">{cron[0].schedule}</span> · {cron[0].active ? "active" : "inactive"}</>
+                      ) : (
+                        <> · schedule unavailable</>
+                      )}
+                    </p>
+                    <p className="mt-1">Next run: {fmtDateTime(status.next_scheduled)}</p>
                     <p className="mt-1">Last successful execution: {status.last_execute ? `${fmtDateTime(status.last_execute.finished_at ?? status.last_execute.started_at)} (${status.last_execute.deleted_records ?? 0} deleted)` : "never"}</p>
                   </div>
                 </div>
