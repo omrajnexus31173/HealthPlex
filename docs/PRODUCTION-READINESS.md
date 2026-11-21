@@ -101,8 +101,12 @@ photo, and are exact at both thresholds.
    therefore still in the future (2026-11-30 21:00 IST). Vercel Hobby allows one
    cron/day, so the schedule deliberately lives in `pg_cron`.
 4. **Retention has not run against real data.** Every run was inside a rolled-back
-   transaction. Storage-object deletion for archived student photos, and the behaviour
-   at large volumes (hours of scanning, 10⁵+ rows), are untested.
+   transaction, so the behaviour at volume (hours of scanning, 10⁵+ rows, a large
+   backup payload) is untested. Note that the job only ever deletes
+   `attendance_records`: it writes monthly summaries first, then a checksum-verified
+   JSON backup, verifies the backup round-trips, and only then deletes. It never
+   deletes profiles, accounts, templates, settings, or student photo objects, and
+   students can only be soft-deleted (`guard_student_delete`).
 5. **Email is unproven.** Accounts are created with a temporary password shown once to
    the administrator; password reset emails depend on Supabase's default SMTP, which
    has not been exercised (no inbox available here).
