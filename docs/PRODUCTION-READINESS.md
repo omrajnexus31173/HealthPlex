@@ -20,6 +20,8 @@ against the deployed system or by a repeatable script in this repository.
 | Auth is closed to the public | `disable_signup=true`, `mailer_autoconfirm=false`, refresh-token rotation on |
 | Redirect URLs are allow-listed | `site_url=https://healthplex.vercel.app`; `/auth/callback` allow-listed for production and `localhost:3000` |
 | Realtime actually publishes | publication `supabase_realtime` contains `attendance_records`, `notifications`, `kiosk_devices` with `replica identity full` |
+| `/api/admin/*` answers JSON, not an HTML redirect | an unauthenticated fetch of `/api/admin/retention` returns a JSON 401 (confirmed on the production deployment; the previous deployment returned `302 → /login?next=…`) |
+| Unauthenticated page loads are gated | `/retention` redirects to `/login?next=%2Fretention` |
 
 ### Security posture (probed with `set local role` / `request.jwt.claims`)
 | Item | Evidence |
@@ -89,11 +91,15 @@ photo, and are exact at both thresholds.
    0.80 on a live subject and 0.15 on a static photo, but this is **not** ISO/IEC
    30107-3 PAD testing. A determined attacker with a screen-replay or 3-D mask was not
    tested. Treat biometric attendance as a convenience control, not as proof of identity.
-3. **The cron schedule is not proven in production.** `pg_cron` job 1
-   (`healthplex-monthly-attendance-retention`, `0 21 28-31 * *`) exists and its function
-   was executed manually, but no scheduled firing has been observed (the next run is
-   after this work). Vercel Hobby allows one cron/day, so the schedule deliberately
-   lives in `pg_cron`.
+3. **The cron schedule has still never fired on its own.** While verifying it, a real
+   bug was found and fixed: the job compared today against the *first* day of the next
+   month, so the guard was false on every day the job is allowed to run (28–31) and
+   `healthplex_retention_job()` would never have executed. Migration `012` recreates
+   the job with a last-day-of-month guard; the guard now evaluates true only on
+   2026-11-30 for the window 2026-11-28…12-01, and the armed job body was re-run
+   afterwards and logged `success` with no error. The first unattended firing is
+   therefore still in the future (2026-11-30 21:00 IST). Vercel Hobby allows one
+   cron/day, so the schedule deliberately lives in `pg_cron`.
 4. **Retention has not run against real data.** Every run was inside a rolled-back
    transaction. Storage-object deletion for archived student photos, and the behaviour
    at large volumes (hours of scanning, 10⁵+ rows), are untested.
