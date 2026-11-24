@@ -14,6 +14,98 @@ const DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
 
 type Holiday = { holiday_date: string; name: string };
 
+/** numeric(4,3) keeps at most 3 decimals; more precision is meaningless there. */
+const round3 = (n: number) => Math.round(n * 1000) / 1000;
+
+const TIME_RANGE = /^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$/;
+
+type CleanSettings = {
+  gym_name: string;
+  capacity: number;
+  cooldown_minutes: number;
+  entry_exit_enabled: boolean;
+  recognition_threshold: number;
+  recognition_margin: number;
+  liveness_threshold: number;
+  booking_enabled: boolean;
+  capacity_alerts: boolean;
+  opening_hours: Record<string, string>;
+};
+
+/**
+ * Whitelist + validate exactly the columns the Settings save is allowed to write.
+ * Throws an Error with a human-readable message for the first invalid field;
+ * the caller aborts before any request is sent, so Postgres can never answer 400.
+ */
+function validateSettings(s: GymSettings): CleanSettings {
+  const gym_name = (s.gym_name ?? "").trim();
+  if (gym_name.length < 2) throw new Error("Gym name must be at least 2 characters.");
+  if (gym_name.length > 120) throw new Error("Gym name must be 120 characters or fewer.");
+
+  const capacity = Number(s.capacity);
+  if (!Number.isFinite(capacity) || !Number.isInteger(capacity)) throw new Error("Capacity must be a whole number.");
+  if (capacity < 1) throw new Error("Capacity must be at least 1 (the database rejects 0).");
+  if (capacity > 2147483647) throw new Error("Capacity is too large.");
+
+  const cooldown_minutes = Number(s.cooldown_minutes);
+  if (!Number.isFinite(cooldown_minutes) || !Number.isInteger(cooldown_minutes)) throw new Error("Scan cooldown must be a whole number of minutes.");
+  if (cooldown_minutes < 0 || cooldown_minutes > 240) throw new Error("Scan cooldown must be between 0 and 240 minutes.");
+
+  const threshold = (label: string, v: unknown) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0 || n > 1) throw new Error(`${label} must be a number between 0 and 1.`);
+    return round3(n);
+  };
+  const recognition_threshold = threshold("Match confidence threshold", s.recognition_threshold);
+  const recognition_margin = threshold("Second-best margin", s.recognition_margin);
+  const liveness_threshold = threshold("Liveness threshold", s.liveness_threshold);
+
+  // Opening hours drive the attendance operating calendar: the value must be
+  // "HH:MM-HH:MM" or "closed"/"off" (normalised to lowercase) or the calendar SQL
+  // silently treats the day as open. Reject anything else before saving.
+  const DAYS_ORDER = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
+  const src = s.opening_hours ?? {};
+  const opening_hours: Record<string, string> = {};
+  for (const d of DAYS_ORDER) {
+    const raw = String(src[d] ?? "closed").trim().toLowerCase();
+    if (raw === "closed" || raw === "off") {
+      opening_hours[d] = raw === "off" ? "closed" : raw;
+      continue;
+    }
+    if (!TIME_RANGE.test(raw)) {
+      throw new Error(`Opening hours for ${d.toUpperCase()} must look like "06:00-21:00" or "closed" (got "${String(src[d] ?? "")}").`);
+    }
+    const [start, end] = raw.split("-");
+    if (start >= end) throw new Error(`Opening hours for ${d.toUpperCase()} must end after they start (got "${raw}").`);
+    opening_hours[d] = raw;
+  }
+
+  return {
+    gym_name,
+    capacity,
+    cooldown_minutes,
+    entry_exit_enabled: Boolean(s.entry_exit_enabled),
+    recognition_threshold,
+    recognition_margin,
+    liveness_threshold,
+    booking_enabled: Boolean(s.booking_enabled),
+    capacity_alerts: Boolean(s.capacity_alerts),
+    opening_hours,
+  };
+}
+
+type SupabaseErrorLike = { message?: string; code?: string; details?: string | null; hint?: string | null } | null;
+
+/** Turn a PostgREST error into one actionable line instead of a bare "Bad Request" (HTTP 400). */
+function postgrestError(err: SupabaseErrorLike): Error {
+  if (!err) return new Error("Could not save settings (unknown server error).");
+  const parts = [err.message ?? "Could not save settings"];
+  if (err.code) parts.push(`[${err.code}]`);
+  if (err.details) parts.push(`— ${err.details}`);
+  if (err.hint) parts.push(`(hint: ${err.hint})`);
+  return new Error(parts.join(" "));
+}
+
 function SettingsInner() {
   const { profile, refresh } = useAuth();
   const [settings, setSettings] = useState<GymSettings | null>(null);
@@ -46,29 +138,36 @@ function SettingsInner() {
     void load();
   }, [load]);
 
+  // gym_settings.id is a boolean primary key with CHECK (id) — the singleton row is always id = true.
+  // The update must target that same boolean key; never send id/updated_at/retention columns
+  // (retention + min-presence go through admin RPCs which enforce is_super_admin()).
   const save = async () => {
     if (!settings) return;
     setSaving(true);
     setError(null);
     setSaved(false);
     try {
+      // ── Validate everything BEFORE touching the network so a bad value can never
+      // ── reach PostgREST as a 400 (check-constraint / cast failures).
+      const cleaned = validateSettings(settings);
       const supabase = createClient();
+      // Only writable columns, correct types, numerics rounded to the live numeric(4,3) scale.
       const { error: err } = await supabase
         .from("gym_settings")
         .update({
-          gym_name: settings.gym_name,
-          capacity: Number(settings.capacity),
-          cooldown_minutes: Number(settings.cooldown_minutes),
-          entry_exit_enabled: settings.entry_exit_enabled,
-          recognition_threshold: Number(settings.recognition_threshold),
-          recognition_margin: Number(settings.recognition_margin),
-          liveness_threshold: Number(settings.liveness_threshold),
-          booking_enabled: settings.booking_enabled,
-          capacity_alerts: settings.capacity_alerts,
-          opening_hours: settings.opening_hours,
+          gym_name: cleaned.gym_name,
+          capacity: cleaned.capacity,
+          cooldown_minutes: cleaned.cooldown_minutes,
+          entry_exit_enabled: cleaned.entry_exit_enabled,
+          recognition_threshold: cleaned.recognition_threshold,
+          recognition_margin: cleaned.recognition_margin,
+          liveness_threshold: cleaned.liveness_threshold,
+          booking_enabled: cleaned.booking_enabled,
+          capacity_alerts: cleaned.capacity_alerts,
+          opening_hours: cleaned.opening_hours,
         })
         .eq("id", true);
-      if (err) throw err;
+      if (err) throw postgrestError(err);
       setSaved(true);
       await refresh();
       await load();
