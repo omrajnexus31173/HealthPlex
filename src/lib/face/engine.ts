@@ -181,9 +181,14 @@ export const CHALLENGE_TEXT: Record<Challenge, string> = {
   nod: "Slowly nod your head down",
 };
 
+/**
+ * The attendance kiosk is blink-only by product decision: one natural blink is the
+ * entire liveness challenge — no head turns, smiles or nods are ever requested.
+ * (The turn/smile/nod evaluators remain inside scoreLiveness for enrolment-time
+ * diagnostics and the offline pipeline tests, but they are never selected here.)
+ */
 export function randomChallenge(): Challenge {
-  const all: Challenge[] = ["blink", "turn_left", "turn_right", "smile", "nod"];
-  return all[Math.floor(Math.random() * all.length)];
+  return "blink";
 }
 
 function dist(a: { x: number; y: number }, b: { x: number; y: number }) {
