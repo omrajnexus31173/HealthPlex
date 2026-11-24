@@ -25,12 +25,12 @@ import { useCamera } from "@/lib/face/useCamera";
 import {
   CHALLENGE_TEXT,
   detectFaces,
+  euclideanDistance,
   frameQuality,
   loadFaceEngine,
   randomChallenge,
   scoreLiveness,
   type Challenge,
-  type FaceSample,
   type LivenessSample,
 } from "@/lib/face/engine";
 import { identify, type EnrolledTemplate, type ScanOutcome } from "@/lib/face/recognition";
@@ -48,7 +48,7 @@ import {
 } from "@/lib/face/kioskClient";
 import { fmtClock, timeAgo } from "@/lib/format";
 
-type Phase = "idle" | "detecting" | "challenge" | "recognising" | "submitting" | "success" | "failure" | "cooldown";
+type Phase = "idle" | "detecting" | "challenge" | "recognising" | "submitting";
 type ResultCard = {
   tone: "success" | "warn" | "danger";
   title: string;
@@ -63,12 +63,20 @@ type ResultCard = {
 
 // Sampling cadence. A blink lasts ~150 ms; at 420 ms the detector skips right over it,
 // which is why a genuine user kept failing the blink challenge while their eyes were
-// demonstrably closing. ~180 ms keeps a blink inside the sampled window at ~6 fps of
+// demonstrably closing. ~120 ms keeps a blink inside the sampled window at ~8 fps of
 // landmark extraction, which any kiosk-class machine sustains.
 const SCAN_INTERVAL_MS = 180;
 const BLINK_SCAN_INTERVAL_MS = 120;
-/** How long the challenge runs before it is scored. */
-const CHALLENGE_MS = 4200;
+/** Max time the blink challenge may run before it is scored (usually exits much earlier). */
+const CHALLENGE_MS = 3000;
+/** When a blink is confidently passing this early, finalize instead of waiting out the timer. */
+const EARLY_PASS_MIN_MS = 600;
+/** The camera is never restarted; only these brief confirmations appear between scans. */
+const RESULT_SUCCESS_MS = 2200;
+const RESULT_WARN_MS = 2600;
+const RESULT_FAILURE_MS = 3200;
+/** Face-free this long ⇒ re-arm (suppression/holdoff reset for the next student). */
+const ABSENCE_REARM_MS = 1200;
 
 function KioskInner() {
   const { profile, settings, supabase } = useAuth();
@@ -108,6 +116,15 @@ function KioskInner() {
   const challengeStartRef = useRef(0);
   const lastSeenRef = useRef(0);
   const mountedRef = useRef(true);
+  /** Student we just recorded — repeated frames of the same person never re-submit. */
+  const suppressRef = useRef<{ studentId: string; until: number } | null>(null);
+  /** First frame index where the frame was face-free (for re-arming). */
+  const awaySinceRef = useRef<number | null>(null);
+  /** After any terminal failure, hold off starting a new challenge briefly. */
+  const holdoffUntilRef = useRef(0);
+  /** Timer for hiding the result card (scanning never waits for it). */
+  const resultClearRef = useRef<number | null>(null);
+  const lastFaceSeenRef = useRef(0);
 
   const cfg = bundle?.config ?? null;
 
@@ -205,26 +222,37 @@ function KioskInner() {
     }
   };
 
-  const resetToIdle = useCallback((delay = 4200) => {
-    window.setTimeout(() => {
+  // Return the pipeline to scanning IMMEDIATELY after any outcome: drop the per-student
+  // recognition state, go back to the idle phase now, and hide the result card after a
+  // brief confirmation. The camera stream is never restarted; the next student can be
+  // detected while the previous result card is still fading away.
+  const clearScanState = useCallback((cardMs: number, statusText = "Scanning for the next student…") => {
+    busyRef.current = false;
+    livenessRef.current = [];
+    challengeRef.current = null;
+    phaseRef.current = "idle";
+    setChallenge(null);
+    setChallengeProgress(0);
+    setPhase("idle");
+    setStatus(statusText);
+    setHint(null);
+    if (resultClearRef.current) window.clearTimeout(resultClearRef.current);
+    resultClearRef.current = window.setTimeout(() => {
       if (!mountedRef.current) return;
-      busyRef.current = false;
-      livenessRef.current = [];
-      challengeRef.current = null;
-      setChallenge(null);
-      setChallengeProgress(0);
       setResult(null);
       setConfidenceShown(null);
-      setPhase("idle");
-      setStatus("Scanning for a face…");
-      setHint(null);
-    }, delay);
+    }, cardMs);
+  }, []);
+
+  /** Remember a student we just recorded so their repeated frames cannot re-submit. */
+  const suppress = useCallback((studentId: string, cooldownMinutes = 5) => {
+    const mins = Math.max(1, Math.min(24 * 60, Math.floor(Number(cooldownMinutes) || 5)));
+    suppressRef.current = { studentId, until: Date.now() + mins * 60_000 };
   }, []);
 
   const fail = useCallback(
     (card: ResultCard, attempt?: { result: string; reason?: string; student?: string | null; confidence?: number; secondBest?: number; liveness?: number; faces?: number }) => {
       setResult(card);
-      setPhase("failure");
       if (attempt && device) {
         void logAttempt({
           code: device.code,
@@ -237,19 +265,26 @@ function KioskInner() {
           reason: attempt.reason,
         }).catch(() => undefined);
       }
-      resetToIdle(4600);
+      // Briefly hold off a fresh challenge so a non-enrolled / spoofing face cannot
+      // spam new attempts every few seconds; the student retries naturally once the
+      // frame is clear (absence re-arms immediately).
+      holdoffUntilRef.current = Date.now() + 2400;
+      clearScanState(card.tone === "danger" ? RESULT_FAILURE_MS : RESULT_WARN_MS);
     },
-    [device, resetToIdle],
+    [clearScanState, device],
   );
 
   const complete = useCallback(
     async (studentId: string, confidence: number, liveness: number, faces: number) => {
       if (!device) return;
+      // In-flight guard: a submission already running cannot be started twice.
+      if (phaseRef.current === "submitting") return;
+      phaseRef.current = "submitting";
       setPhase("submitting");
       setStatus("Verifying with the gym server…");
-      let res: ScanResponse | null = null;
+      const untilMins = Math.max(1, Number(cfg?.cooldown_minutes ?? 5));
       try {
-        res = await submitScan({
+        const res: ScanResponse = await submitScan({
           code: device.code,
           studentId,
           confidence,
@@ -258,6 +293,7 @@ function KioskInner() {
           meta: { threshold: cfg?.recognition_threshold, liveness_threshold: cfg?.liveness_threshold },
         });
         const student = studentsRef.current.get(studentId);
+        setConfidenceShown(confidence);
         if (res.status === "success" && res.student) {
           setResult({
             tone: "success",
@@ -271,8 +307,10 @@ function KioskInner() {
             details: `${(confidence * 100).toFixed(1)}% match · liveness ${(liveness * 100).toFixed(0)}%`,
           });
           setInsideCount(res.inside_count ?? null);
-          setPhase("success");
-          setStatus("Attendance recorded");
+          // Same student standing in frame must never re-submit (and never flap into an
+          // immediate exit) — remember them until they leave / the cooldown passes.
+          suppress(studentId, untilMins);
+          clearScanState(RESULT_SUCCESS_MS, "Attendance recorded — scanning for the next student…");
         } else if (res.status === "cooldown" || res.status === "duplicate") {
           setResult({
             tone: "warn",
@@ -282,7 +320,8 @@ function KioskInner() {
             enrollment: res.student?.enrollment ?? student?.enrollment_id,
             photo: photosRef.current[studentId] ?? null,
           });
-          setPhase("cooldown");
+          suppress(studentId, untilMins);
+          clearScanState(RESULT_WARN_MS, "Already recorded — scanning for the next student…");
         } else if (res.status === "inactive") {
           setResult({
             tone: "danger",
@@ -292,24 +331,24 @@ function KioskInner() {
             enrollment: res.student?.enrollment,
             photo: photosRef.current[studentId] ?? null,
           });
-          setPhase("failure");
+          holdoffUntilRef.current = Date.now() + 3000;
+          clearScanState(RESULT_FAILURE_MS);
         } else {
           setResult({ tone: "danger", title: "Not recorded", message: res.message });
-          setPhase("failure");
+          clearScanState(RESULT_FAILURE_MS);
         }
       } catch (e) {
+        setConfidenceShown(confidence);
         setResult({
           tone: "danger",
           title: "Server rejected the scan",
           message: e instanceof Error ? e.message : "Attendance could not be recorded",
         });
-        setPhase("failure");
-      } finally {
-        setConfidenceShown(confidence);
-        resetToIdle(res?.status === "success" ? 5200 : 4600);
+        holdoffUntilRef.current = Date.now() + 2000;
+        clearScanState(RESULT_FAILURE_MS);
       }
     },
-    [cfg, device, resetToIdle],
+    [cfg, device, suppress, clearScanState],
   );
 
   /* --------------------------------------------------- detection loop */
@@ -321,7 +360,7 @@ function KioskInner() {
       if (!running) return;
       const video = videoRef.current;
       const p = phaseRef.current;
-      if (!video || video.readyState < 2 || busyRef.current || p === "success" || p === "submitting" || p === "failure" || p === "cooldown") {
+      if (!video || video.readyState < 2 || busyRef.current || p === "submitting") {
         window.setTimeout(loop, SCAN_INTERVAL_MS);
         return;
       }
@@ -330,17 +369,37 @@ function KioskInner() {
         const samples = await detectFaces(video);
         if (!running || busyRef.current) return;
         setFacesSeen(samples.length);
+        const now0 = Date.now();
 
         if (samples.length === 0) {
+          if (awaySinceRef.current == null) awaySinceRef.current = now0;
+          // A challenge whose face disappeared is cancelled — the next person starts clean.
+          if (challengeRef.current && lastFaceSeenRef.current && now0 - lastFaceSeenRef.current > 1300) {
+            livenessRef.current = [];
+            challengeRef.current = null;
+            setChallenge(null);
+            setChallengeProgress(0);
+            phaseRef.current = "idle";
+            setPhase("idle");
+            setStatus("Looking for a face…");
+            setHint("Stand in front of the camera and blink once");
+          }
+          // Face-free for long enough ⇒ the next person is someone new: re-arm fully.
+          if (now0 - awaySinceRef.current >= ABSENCE_REARM_MS) {
+            suppressRef.current = null;
+            holdoffUntilRef.current = 0;
+          }
           if (phaseRef.current !== "challenge") {
             setPhase("idle");
             setStatus("Looking for a face…");
-            setHint("Stand in front of the kiosk and look at the camera");
+            setHint("Stand in front of the kiosk and blink once");
           }
-          lastSeenRef.current = 0;
+          lastFaceSeenRef.current = 0;
           window.setTimeout(loop, SCAN_INTERVAL_MS);
           return;
         }
+        awaySinceRef.current = null;
+        lastFaceSeenRef.current = now0;
 
         if (samples.length > 1) {
           if (Date.now() - lastSeenRef.current > 4000) {
@@ -364,118 +423,161 @@ function KioskInner() {
         const sample = samples[0];
         const q = frameQuality(sample, video.videoWidth || 1280, video.videoHeight || 720);
         if (!q.ok) {
+          phaseRef.current = "detecting";
           setPhase("detecting");
           setStatus(q.reasons[0] ?? "Adjust your position");
           setHint(q.reasons.join(" · "));
-          lastSeenRef.current = 0;
           window.setTimeout(loop, SCAN_INTERVAL_MS);
           return;
         }
 
-        // ---- liveness challenge choreography
+        // ---- same-student suppression: a student we just recorded must never re-submit.
+        // A face whose descriptor is far from the suppressed student's template is a
+        // different person — re-arm immediately so the queue never waits.
+        if (suppressRef.current) {
+          if (Date.now() >= suppressRef.current.until) {
+            suppressRef.current = null;
+          } else {
+            const sup = suppressRef.current;
+            const mine = templatesRef.current.find((t) => t.student_id === sup.studentId);
+            const gate = (cfg?.recognition_threshold ?? 0.48) + 0.12;
+            const d = mine ? euclideanDistance(sample.descriptor, mine.descriptor) : Infinity;
+            if (!mine || d > gate) {
+              suppressRef.current = null; // not the recorded student — fall through to scanning
+            } else {
+              phaseRef.current = "idle";
+              setPhase("idle");
+              setStatus("Attendance already recorded — see you soon");
+              setHint(null);
+              window.setTimeout(loop, 250);
+              return;
+            }
+          }
+        }
+        if (holdoffUntilRef.current > Date.now()) {
+          phaseRef.current = "idle";
+          setPhase("idle");
+          window.setTimeout(loop, 200);
+          return;
+        }
+
+        // ---- blink-only liveness challenge: one natural blink, no head turns ever
         if (!challengeRef.current) {
-          const c = randomChallenge();
+          const c = randomChallenge(); // blink-only by design
           challengeRef.current = c;
           challengeStartRef.current = Date.now();
           livenessRef.current = [{ landmarks: sample.landmarks, t: Date.now() }];
           setChallenge(c);
+          phaseRef.current = "challenge";
           setPhase("challenge");
           setChallengeProgress(0);
           setStatus(CHALLENGE_TEXT[c]);
-          setHint("Liveness check keeps photos and screens from marking attendance");
-          window.setTimeout(loop, c === "blink" ? BLINK_SCAN_INTERVAL_MS : SCAN_INTERVAL_MS);
+          setHint("One natural blink proves you are present — no head turns or gestures");
+          window.setTimeout(loop, BLINK_SCAN_INTERVAL_MS);
           return;
         }
 
         const elapsed = Date.now() - challengeStartRef.current;
         livenessRef.current.push({ landmarks: sample.landmarks, t: Date.now() });
         setChallengeProgress(Math.min(100, Math.round((elapsed / CHALLENGE_MS) * 100)));
-        const cadence = challengeRef.current === "blink" ? BLINK_SCAN_INTERVAL_MS : SCAN_INTERVAL_MS;
 
-        if (elapsed < CHALLENGE_MS) {
-          setStatus(CHALLENGE_TEXT[challengeRef.current]);
-          window.setTimeout(loop, cadence);
-          return;
-        }
+        // Shared finaliser: liveness gate → fresh single-face check → match → submit.
+        const finish = async (live: ReturnType<typeof scoreLiveness>) => {
+          busyRef.current = true;
+          phaseRef.current = "recognising";
+          setPhase("recognising");
+          setStatus("Verifying your identity…");
+          const livenessGate = cfg?.liveness_threshold ?? 0.6;
+          if (live.score < livenessGate) {
+            fail(
+              {
+                tone: "danger",
+                title: "Liveness check failed",
+                message: `${live.reason ?? "We could not confirm a live face"} (score ${(live.score * 100).toFixed(0)}%). Photos, videos and phone screens cannot mark attendance.`,
+              },
+              {
+                result: "liveness_failed",
+                liveness: live.score,
+                faces: 1,
+                reason: live.reason ?? "liveness score below threshold",
+              },
+            );
+            return;
+          }
 
-        // ---- evaluate liveness then identify
-        busyRef.current = true;
-        setPhase("recognising");
-        setStatus("Verifying your identity…");
-        const live = scoreLiveness(livenessRef.current, challengeRef.current);
-        const threshold = cfg?.liveness_threshold ?? 0.6;
-        if (live.score < threshold) {
+          const fresh = await detectFaces(video);
+          if (!running) return;
+          if (fresh.length !== 1) {
+            fail(
+              { tone: "warn", title: "Frame changed", message: "Keep one face in the frame while attendance is captured." },
+              { result: fresh.length ? "multiple_faces" : "no_face", faces: fresh.length, liveness: live.score },
+            );
+            return;
+          }
+
+          const outcome: ScanOutcome = identify(fresh, templatesRef.current, {
+            threshold: cfg?.recognition_threshold ?? 0.48,
+            margin: cfg?.recognition_margin ?? 0.06,
+          });
+
+          if (outcome.kind === "match") {
+            await complete(outcome.studentId, outcome.confidence, live.score, 1);
+            return;
+          }
+          if (outcome.kind === "ambiguous") {
+            fail(
+              {
+                tone: "warn",
+                title: "Match too close to call",
+                message: "Two enrolled profiles are equally close. Please use ID verification at the desk instead.",
+              },
+              { result: "ambiguous_match", confidence: outcome.confidence, secondBest: outcome.second, liveness: live.score, faces: 1 },
+            );
+            return;
+          }
+          if (outcome.kind === "multiple_faces") {
+            fail({ tone: "warn", title: "One person at a time", message: "Multiple faces detected." }, { result: "multiple_faces", faces: outcome.count });
+            return;
+          }
+          if (outcome.kind === "no_face") {
+            fail({ tone: "warn", title: "Face lost", message: "Please stay in front of the camera." }, { result: "no_face" });
+            return;
+          }
+          // unknown
+          const low = outcome.confidence > 0;
           fail(
             {
               tone: "danger",
-              title: "Liveness check failed",
-              message: `${live.reason ?? "We could not confirm a live face"} (score ${(live.score * 100).toFixed(0)}%). Photos, videos and phone screens cannot mark attendance.`,
+              title: low ? "Not recognised" : "No enrolled face",
+              message: low
+                ? `Best match was only ${(outcome.confidence * 100).toFixed(0)}% — below the ${Math.round((cfg?.recognition_threshold ?? 0.48) * 100)}% requirement. Visit the gym desk for ID verification.`
+                : "This face is not enrolled for gym attendance. Visit the gym desk to complete face enrollment.",
             },
             {
-              result: "liveness_failed",
-              confidence: undefined,
+              result: low ? "low_confidence" : "unknown_face",
+              confidence: outcome.confidence,
               liveness: live.score,
               faces: 1,
-              reason: live.reason ?? "liveness score below threshold",
             },
           );
-          return;
-        }
+        };
 
-        const fresh = await detectFaces(video);
-        if (fresh.length !== 1) {
-          fail(
-            { tone: "warn", title: "Frame changed", message: "Keep one face in the frame while attendance is captured." },
-            { result: fresh.length ? "multiple_faces" : "no_face", faces: fresh.length, liveness: live.score },
-          );
+        if (elapsed >= CHALLENGE_MS) {
+          await finish(scoreLiveness(livenessRef.current, "blink"));
           return;
         }
-
-        const outcome: ScanOutcome = identify(fresh, templatesRef.current, {
-          threshold: cfg?.recognition_threshold ?? 0.48,
-          margin: cfg?.recognition_margin ?? 0.06,
-        });
-
-        if (outcome.kind === "match") {
-          await complete(outcome.studentId, outcome.confidence, live.score, 1);
-          return;
+        // One confident natural blink is enough — finalise immediately instead of
+        // waiting out the timer. Liveness thresholds are unchanged.
+        if (elapsed >= EARLY_PASS_MIN_MS) {
+          const live = scoreLiveness(livenessRef.current, "blink");
+          if (live.score >= (cfg?.liveness_threshold ?? 0.6)) {
+            await finish(live);
+            return;
+          }
         }
-        if (outcome.kind === "ambiguous") {
-          fail(
-            {
-              tone: "warn",
-              title: "Match too close to call",
-              message: "Two enrolled profiles are equally close. Please use ID verification at the desk instead.",
-            },
-            { result: "ambiguous_match", confidence: outcome.confidence, secondBest: outcome.second, liveness: live.score, faces: 1 },
-          );
-          return;
-        }
-        if (outcome.kind === "multiple_faces") {
-          fail({ tone: "warn", title: "One person at a time", message: "Multiple faces detected." }, { result: "multiple_faces", faces: outcome.count });
-          return;
-        }
-        if (outcome.kind === "no_face") {
-          fail({ tone: "warn", title: "Face lost", message: "Please stay in front of the camera." }, { result: "no_face" });
-          return;
-        }
-        // unknown
-        const low = outcome.confidence > 0;
-        fail(
-          {
-            tone: "danger",
-            title: low ? "Not recognised" : "No enrolled face",
-            message: low
-              ? `Best match was only ${(outcome.confidence * 100).toFixed(0)}% — below the ${Math.round((cfg?.recognition_threshold ?? 0.48) * 100)}% requirement. Visit the gym desk for ID verification.`
-              : "This face is not enrolled for gym attendance. Visit the gym desk to complete face enrollment.",
-          },
-          {
-            result: low ? "low_confidence" : "unknown_face",
-            confidence: outcome.confidence,
-            liveness: live.score,
-            faces: 1,
-          },
-        );
+        setStatus(CHALLENGE_TEXT[challengeRef.current]);
+        window.setTimeout(loop, BLINK_SCAN_INTERVAL_MS);
+        return;
       } catch {
         window.setTimeout(loop, 1200);
       }
@@ -605,12 +707,12 @@ function KioskInner() {
           <div className="flex flex-col gap-4">
             <div
               className={`relative aspect-video w-full overflow-hidden rounded-3xl border ${
-                phase === "success" ? "border-mint-400/70 hp-success-flash" : phase === "failure" ? "border-[#ff5e47]/50" : "border-white/10"
+                result?.tone === "success" ? "border-mint-400/70 hp-success-flash" : result?.tone === "danger" ? "border-[#ff5e47]/50" : "border-white/10"
               } bg-black`}
             >
               <video
                 ref={videoRef}
-                className={`h-full w-full scale-x-[-1] object-cover transition-opacity duration-500 ${phase === "success" ? "opacity-90" : "opacity-100"}`}
+                className={`h-full w-full scale-x-[-1] object-cover transition-opacity duration-500 ${result?.tone === "success" ? "opacity-90" : "opacity-100"}`}
                 playsInline
                 muted
                 autoPlay
@@ -641,9 +743,9 @@ function KioskInner() {
                     <div className="absolute inset-0 flex items-center justify-center">
                       <div
                         className={`relative h-[72%] w-[46%] rounded-[45%] border-2 transition-colors duration-300 ${
-                          phase === "success"
+                          result?.tone === "success"
                             ? "border-mint-400"
-                            : phase === "failure"
+                            : result?.tone === "danger"
                               ? "border-[#ff5e47]"
                               : facesSeen === 1
                                 ? "border-mint-400/80"
@@ -672,9 +774,9 @@ function KioskInner() {
                     {/* status pill */}
                     <div className="absolute inset-x-0 top-4 flex justify-center">
                       <div className="flex items-center gap-2 rounded-full border border-white/10 bg-navy-950/75 px-3.5 py-1.5 backdrop-blur">
-                        {phase === "success" ? (
+                        {result?.tone === "success" ? (
                           <CheckCircle2 size={14} className="text-mint-400" />
-                        ) : phase === "failure" ? (
+                        ) : result?.tone === "danger" ? (
                           <XCircle size={14} className="text-[#ff8f6b]" />
                         ) : phase === "challenge" ? (
                           <ShieldCheck size={14} className="text-mint-300" />
@@ -794,7 +896,7 @@ function KioskInner() {
               <ol className="mt-2.5 space-y-2">
                 {[
                   "Stand in front of the camera — detection is automatic.",
-                  "Complete the random liveness prompt (blink, turn, smile).",
+                  "Blink once when prompted — one natural blink is the whole liveness check.",
                   "The system matches your enrolled face on this device.",
                   "Attendance is stored with server time in Asia/Kolkata.",
                 ].map((t, i) => (

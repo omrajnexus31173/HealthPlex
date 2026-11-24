@@ -302,7 +302,7 @@ function SettingsInner() {
               <div>
                 <div className="mb-1 flex items-center justify-between"><label className="hp-label mb-0">Liveness threshold</label><span className="text-[12px] font-semibold text-mint-300">{Math.round(Number(settings.liveness_threshold) * 100)}%</span></div>
                 <input type="range" min={40} max={90} step={1} value={Math.round(Number(settings.liveness_threshold) * 100)} onChange={(e) => setSettings({ ...settings, liveness_threshold: Number(e.target.value) / 100 })} className="w-full accent-mint-500" />
-                <p className="mt-0.5 text-[10px] text-ink-400">Challenge-response liveness (blink / head turn / smile). Not a certified ISO 30107-3 PAD.</p>
+                <p className="mt-0.5 text-[10px] text-ink-400">Challenge-response liveness (blink-only — one natural blink). Not a certified ISO 30107-3 PAD.</p>
               </div>
               <div className="rounded-xl border border-white/6 bg-navy-950/40 p-3 text-[10.5px] leading-relaxed text-ink-400">
                 <p className="flex items-center gap-1.5 font-semibold text-white"><ShieldCheck size={12} className="text-mint-300" /> Enforced server-side</p>

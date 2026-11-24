@@ -72,7 +72,7 @@ function MyFace() {
           <Card className="flex items-start gap-2 p-4">
             <ScanFace size={15} className="mt-0.5 shrink-0 text-mint-300" />
             <p className="text-[11px] leading-relaxed text-ink-400">
-              At the gym entrance, stand in front of the kiosk and follow the on-screen liveness prompt (blink, turn or smile).
+              At the gym entrance, stand in front of the kiosk and blink once when prompted.
               Attendance is marked automatically within a couple of seconds.
             </p>
           </Card>
